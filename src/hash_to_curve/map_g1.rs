@@ -529,9 +529,7 @@ impl Sgn0 for Fp {
     fn sgn0(&self) -> Choice {
         // Turn into canonical form by computing
         // (a.R) / R = a
-        let tmp = Fp::montgomery_reduce(
-            self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5], 0, 0, 0, 0, 0, 0,
-        );
+        let tmp = FpWide::from(self).montgomery_reduce();
         Choice::from((tmp.0[0] & 1) as u8)
     }
 }

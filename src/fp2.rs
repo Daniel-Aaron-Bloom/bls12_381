@@ -312,10 +312,13 @@ impl Fp2 {
         // of (a + bu). Importantly, this can be computing using
         // only a single inversion in Fp.
 
-        (self.c0.square() + self.c1.square()).invert().map(|t| Fp2 {
-            c0: self.c0 * t,
-            c1: self.c1 * -t,
-        })
+        (self.c0.square_unreduced() + self.c1.square_unreduced())
+            .montgomery_reduce()
+            .invert()
+            .map(|t| Fp2 {
+                c0: self.c0 * t,
+                c1: self.c1 * -t,
+            })
     }
 
     /// Although this is labeled "vartime", it is only

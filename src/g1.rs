@@ -171,7 +171,7 @@ where
 }
 
 impl_binops_additive!(G1Projective, G1Affine);
-impl_binops_additive_specify_output!(G1Affine, G1Projective, G1Projective);
+impl_binops_additive_output!(G1Affine, G1Projective);
 
 const B: Fp = Fp::from_raw_unchecked([
     0xaa27_0000_000c_fff3,
@@ -595,9 +595,9 @@ impl_binops_multiplicative_mixed!(Scalar, G1Projective, G1Projective);
 
 #[inline(always)]
 fn mul_by_3b(a: Fp) -> Fp {
-    let a = a + a; // 2
-    let a = a + a; // 4
-    a + a + a // 12
+    let a = a.double(); // 2
+    let a = a.double(); // 4
+    a.double() + a // 12
 }
 
 impl G1Projective {
@@ -639,27 +639,27 @@ impl G1Projective {
         // Algorithm 9, https://eprint.iacr.org/2015/1060.pdf
 
         let t0 = self.y.square();
-        let z3 = t0 + t0;
-        let z3 = z3 + z3;
-        let z3 = z3 + z3;
+        let z3 = t0.double();
+        let z3 = z3.double();
+        let z3 = z3.double();
         let t1 = self.y * self.z;
         let t2 = self.z.square();
         let t2 = mul_by_3b(t2);
-        let x3 = t2 * z3;
+        let x3 = t2.mul_unreduced(&z3); // t2 * z3
         let y3 = t0 + t2;
         let z3 = t1 * z3;
-        let t1 = t2 + t2;
+        let t1 = t2.double();
         let t2 = t1 + t2;
         let t0 = t0 - t2;
-        let y3 = t0 * y3;
+        let y3 = t0.mul_unreduced(&y3); // t0 * y3
         let y3 = x3 + y3;
         let t1 = self.x * self.y;
         let x3 = t0 * t1;
-        let x3 = x3 + x3;
+        let x3 = x3.double();
 
         let tmp = G1Projective {
             x: x3,
-            y: y3,
+            y: y3.montgomery_reduce(),
             z: z3,
         };
 
@@ -688,26 +688,26 @@ impl G1Projective {
         let x3 = x3 * y3;
         let y3 = t0 + t2;
         let y3 = x3 - y3;
-        let x3 = t0 + t0;
+        let x3 = t0.double();
         let t0 = x3 + t0;
         let t2 = mul_by_3b(t2);
         let z3 = t1 + t2;
         let t1 = t1 - t2;
         let y3 = mul_by_3b(y3);
-        let x3 = t4 * y3;
-        let t2 = t3 * t1;
+        let x3 = t4.mul_unreduced(&y3); // t4 * y3
+        let t2 = t3.mul_unreduced(&t1); // t3 * t1
         let x3 = t2 - x3;
-        let y3 = y3 * t0;
-        let t1 = t1 * z3;
+        let y3 = y3.mul_unreduced(&t0); // y3 * t0
+        let t1 = t1.mul_unreduced(&z3); // t1 * z3
         let y3 = t1 + y3;
-        let t0 = t0 * t3;
-        let z3 = z3 * t4;
+        let t0 = t0.mul_unreduced(&t3); // t0 * t3
+        let z3 = z3.mul_unreduced(&t4); // z3 * t4
         let z3 = z3 + t0;
 
         G1Projective {
-            x: x3,
-            y: y3,
-            z: z3,
+            x: x3.montgomery_reduce(),
+            y: y3.montgomery_reduce(),
+            z: z3.montgomery_reduce(),
         }
     }
 
@@ -726,26 +726,26 @@ impl G1Projective {
         let t4 = t4 + self.y;
         let y3 = rhs.x * self.z;
         let y3 = y3 + self.x;
-        let x3 = t0 + t0;
+        let x3 = t0.double();
         let t0 = x3 + t0;
         let t2 = mul_by_3b(self.z);
         let z3 = t1 + t2;
         let t1 = t1 - t2;
         let y3 = mul_by_3b(y3);
-        let x3 = t4 * y3;
-        let t2 = t3 * t1;
+        let x3 = t4.mul_unreduced(&y3); // t4 * y3
+        let t2 = t3.mul_unreduced(&t1); // t3 * t1
         let x3 = t2 - x3;
-        let y3 = y3 * t0;
-        let t1 = t1 * z3;
+        let y3 = y3.mul_unreduced(&t0); // y3 * t0
+        let t1 = t1.mul_unreduced(&z3); // t1 * z3
         let y3 = t1 + y3;
-        let t0 = t0 * t3;
-        let z3 = z3 * t4;
+        let t0 = t0.mul_unreduced(&t3); // t0 * t3
+        let z3 = z3.mul_unreduced(&t4); // z3 * t4
         let z3 = z3 + t0;
 
         let tmp = G1Projective {
-            x: x3,
-            y: y3,
-            z: z3,
+            x: x3.montgomery_reduce(),
+            y: y3.montgomery_reduce(),
+            z: z3.montgomery_reduce(),
         };
 
         G1Projective::conditional_select(&tmp, self, rhs.is_identity())
@@ -849,8 +849,11 @@ impl G1Projective {
     pub fn is_on_curve(&self) -> Choice {
         // Y^2 Z = X^3 + b Z^3
 
-        (self.y.square() * self.z).ct_eq(&(self.x.square() * self.x + self.z.square() * self.z * B))
-            | self.z.is_zero()
+        let lhs = self.y.square() * self.z;
+        let rhs = (self.x.square().mul_unreduced(&self.x)
+            + self.z.square().mul_unreduced(&(self.z * B)))
+        .montgomery_reduce();
+        lhs.ct_eq(&rhs) | self.z.is_zero()
     }
 }
 

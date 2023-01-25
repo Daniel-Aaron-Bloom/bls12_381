@@ -172,7 +172,7 @@ where
 }
 
 impl_binops_additive!(G2Projective, G2Affine);
-impl_binops_additive_specify_output!(G2Affine, G2Projective, G2Projective);
+impl_binops_additive_output!(G2Affine, G2Projective);
 
 const B: Fp2 = Fp2 {
     c0: Fp::from_raw_unchecked([

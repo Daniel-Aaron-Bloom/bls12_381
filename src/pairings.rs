@@ -185,7 +185,7 @@ impl<'a, 'b> Add<&'b MillerLoopResult> for &'a MillerLoopResult {
     }
 }
 
-impl_add_binop_specify_output!(MillerLoopResult, MillerLoopResult, MillerLoopResult);
+impl_add_binop!(MillerLoopResult, MillerLoopResult);
 
 impl AddAssign<MillerLoopResult> for MillerLoopResult {
     #[inline]
