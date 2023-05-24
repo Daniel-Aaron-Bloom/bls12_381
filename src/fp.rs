@@ -98,7 +98,7 @@ const fn subtract_p<const VARTIME: bool>(v: &[u64; 6], modulus: &[u64; 6]) -> [u
         true if borrow => *v,
         true => [r0, r1, r2, r3, r4, r5],
         false => {
-            let borrow = borrow as u64;
+            let borrow = borrow as u64 * u64::MAX;
             [
                 (v[0] & borrow) | (r0 & !borrow),
                 (v[1] & borrow) | (r1 & !borrow),
