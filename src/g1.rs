@@ -9,13 +9,14 @@ use group::{
     Curve, Group, GroupEncoding, UncompressedEncoding,
 };
 use rand_core::RngCore;
-use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption, ConditionallyNegatable};
 
 #[cfg(feature = "alloc")]
 use group::WnafGroup;
 
 use crate::fp::Fp;
 use crate::Scalar;
+use crate::util::{sbb, mac};
 
 /// This is an element of $\mathbb{G}_1$ represented in the affine coordinate space.
 /// It is ideal to keep elements in this representation to reduce memory usage and
@@ -427,6 +428,102 @@ pub const BETA: Fp = Fp::from_raw_unchecked([
     0x051b_a4ab_241b_6160,
 ]);
 
+const BETA_2: Fp = Fp::from_raw_unchecked([
+    0xCD03_C9E4_8671_F071,
+    0x5DAB_2246_1FCD_A5D2,
+    0x5870_42AF_D385_1B95,
+    0x8EB6_0EBE_01BA_CB9E,
+    0x03F9_7D6E_83D0_50D2,
+    0x18F0_2065_5463_8741
+]);
+
+// The recoding width that determines the length and size of precomputation table.
+// Tested values are in 3..8.
+const G1_WIDTH: i32 = 5;
+
+#[inline]
+const fn sub_short(a: &[u64; 4], b: &[u64; 4]) -> ([u64; 4], i8) {
+    let (d0, borrow) = sbb(a[0], b[0], 0);
+    let (d1, borrow) = sbb(a[1], b[1], borrow);
+    let (d2, borrow) = sbb(a[2], b[2], borrow);
+    let (d3, borrow) = sbb(a[3], b[3], borrow);
+    ([d0, d1, d2, d3], borrow as i8)
+}
+
+#[inline]
+const fn mul_short(a: &[u64; 4], b: &[u64; 4]) -> [u64; 8] {
+    // Schoolbook multiplication
+    let (r0, carry) = mac(0, a[0], b[0], 0);
+    let (r1, carry) = mac(0, a[0], b[1], carry);
+    let (r2, carry) = mac(0, a[0], b[2], carry);
+    let r3 = carry;
+
+    let (r1, carry) = mac(r1, a[1], b[0], 0);
+    let (r2, carry) = mac(r2, a[1], b[1], carry);
+    let (r3, carry) = mac(r3, a[1], b[2], carry);
+    let r4 = carry;
+
+    let (r2, carry) = mac(r2, a[2], b[0], 0);
+    let (r3, carry) = mac(r3, a[2], b[1], carry);
+    let (r4, carry) = mac(r4, a[2], b[2], carry);
+    let r5 = carry;
+
+    let (r3, carry) = mac(r3, a[3], b[0], 0);
+    let (r4, carry) = mac(r4, a[3], b[1], carry);
+    let (r5, carry) = mac(r5, a[3], b[2], carry);
+    let r6 = carry;
+
+    [r0, r1, r2, r3, r4, r5, r6, 0]
+}
+
+fn glv_recoding(k: &[u8; 32]) -> (i8,[u8;32],i8,[u8;32]) {
+    const V: [[u64; 4]; 2] = [
+        [0x63f6_e522_f6cf_ee2f, 0x7c6b_ecf1_e01f_aadd, 1, 0],
+        [0x0000_0000_ffff_ffff, 0xac45_a401_0001_a402, 0, 0]
+    ];
+
+    let t: [u64; 4] = [
+        u64::from_le_bytes(k[0..8].try_into().unwrap()),
+        u64::from_le_bytes(k[8..16].try_into().unwrap()),
+        u64::from_le_bytes(k[16..24].try_into().unwrap()),
+        u64::from_le_bytes(k[24..32].try_into().unwrap()),
+    ];
+
+    /* Multiply b2 by v[0] and round. */
+    let b2 = mul_short(&t, &V[0]);
+    let b2h = [b2[4] + (b2[3] >> 63), b2[5], b2[6], b2[7]];
+
+    let b1 = mul_short(&b2h, &V[1]);
+    let b1l = [b1[0], b1[1], b1[2], b1[3]];
+    let (b1l, s1) = sub_short(&t, &b1l);
+    let minus_k1 = Scalar::from_raw([!b1l[0], !b1l[1], !b1l[2], !b1l[3]]) + Scalar::one();
+
+    let k1 = Scalar::from_raw(b1l);
+    let k1 = Scalar::conditional_select(&k1, &minus_k1, Choice::from(-s1 as u8));
+    let k2 = Scalar::from_raw(b2h);
+
+    // k2 is always positive for this curve.
+    (s1, k1.to_bytes(), 0, k2.to_bytes())
+}
+
+fn regular_recoding(naf: &mut [i8; 128], sc: &mut [u8; 32]) {
+    let w = G1_WIDTH;
+    // Joux-Tunstall regular recoding algorithm for parameterized w.
+    let mask = (1 << w) - 1;
+    let len = 2 + (naf.len()-1)/(w - 1) as usize;
+
+    for i in 0..(len - 1) {
+        naf[i] = ((sc[0] & mask) as i8) - (1 << (w - 1));
+        sc[0] = ((sc[0] as i8) - naf[i]) as u8;
+        // Divide by (w - 1)
+        for j in 0..31 {
+            sc[j] = (sc[j] >> (w - 1)) | sc[j + 1] << (8 - (w - 1));
+        }
+        sc[31] >>= w - 1;
+    }
+    naf[len - 1] = sc[0] as i8;
+}   
+
 fn endomorphism(p: &G1Affine) -> G1Affine {
     // Endomorphism of the points on the curve.
     // endomorphism_p(x,y) = (BETA * x, y)
@@ -557,7 +654,7 @@ impl<'a, 'b> Mul<&'b Scalar> for &'a G1Projective {
     type Output = G1Projective;
 
     fn mul(self, other: &'b Scalar) -> Self::Output {
-        self.multiply(&other.to_bytes())
+        self.multiply::<false>(&other.to_bytes())
     }
 }
 
@@ -574,7 +671,7 @@ impl<'a, 'b> Mul<&'b Scalar> for &'a G1Affine {
     type Output = G1Projective;
 
     fn mul(self, other: &'b Scalar) -> Self::Output {
-        G1Projective::from(self).multiply(&other.to_bytes())
+        G1Projective::from(self).multiply::<false>(&other.to_bytes())
     }
 }
 
@@ -751,26 +848,86 @@ impl G1Projective {
         G1Projective::conditional_select(&tmp, self, rhs.is_identity())
     }
 
-    fn multiply(&self, by: &[u8; 32]) -> G1Projective {
+    //fn precompute(&self) -> [G1Affine; 1 << (G1_WIDTH - 2)] {
+    fn precompute(&self) -> [G1Projective; 1 << (G1_WIDTH - 2)] {
+        // Size of precomputation table is 2^(w-2).
+        //let mut table = [G1Affine::from(self); 1 << (G1_WIDTH - 2)];
+        let mut proj_table = [*self; 1 << (G1_WIDTH - 2)];
+        if G1_WIDTH > 2 {
+            let double_point = self.double();
+            let mut prev = *self;
+            for i in proj_table.iter_mut().skip(1) {
+                prev += double_point;
+                *i = prev;
+            }
+            //G1Projective::batch_normalize(&proj_table[1..], &mut table[1..]);
+        }
+        proj_table
+        //table
+    }
+
+    fn linear_pass<T: Default+ConditionallySelectable>(index: u8, table: &[T]) -> T {
+        // Scan table of points to read table[index]
+        let mut tmp = table[0];
+        for (j, jv) in table.iter().enumerate().skip(1) {
+            tmp.conditional_assign(jv, (j as u8).ct_eq(&index));
+        }
+        tmp
+    }
+
+    fn multiply<const VARTIME: bool>(&self, by: &[u8; 32]) -> G1Projective {
         let mut acc = G1Projective::identity();
 
-        // This is a simple double-and-add implementation of point
-        // multiplication, moving from most significant to least
-        // significant bit of the scalar.
-        //
-        // We skip the leading bit because it's always unset for Fq
-        // elements.
-        for bit in by
-            .iter()
-            .rev()
-            .flat_map(|byte| (0..8).rev().map(move |i| Choice::from((byte >> i) & 1u8)))
-            .skip(1)
-        {
-            acc = acc.double();
-            acc = G1Projective::conditional_select(&acc, &(acc + self), bit);
-        }
+        // Length of recoding is ceil(scalar bitlength, w - 1).
+        let len = 2 + (128-1)/(G1_WIDTH - 1) as usize;
 
-        acc
+        // Allocate longest possible vector, recode scalar and precompute table.
+        let mut naf1 = [0 as i8; 128];
+        let mut naf2 = [0 as i8; 128];
+        let (s1, mut k1, s2, mut k2) = glv_recoding(&by);
+        let mut table = self.precompute();
+        
+        let bit1 = k1[0] & 1u8;
+        k1[0] |= 1;
+        let bit2 = k2[0] & 1u8;
+        k2[0] |= 1;
+
+        regular_recoding(&mut naf1, &mut k1);
+        regular_recoding(&mut naf2, &mut k2);
+
+        for i in (0..len).rev() {
+            for _ in 1..G1_WIDTH {
+                acc = acc.double();
+            }
+            let sign = naf1[i] >> 7;
+            let index = ((naf1[i] ^ sign) - sign) >> 1;
+            let t = match VARTIME {
+                // Negate point if either k1 or naf1[i] is negative.
+                true if sign != s1 => -table[index as usize],
+                true => table[index as usize],
+                false => {
+                    let mut t = Self::linear_pass(index as u8, &table);
+                    // Negate point if either k1 or naf1[i] is negative.
+                    t.conditional_negate(Choice::from(-(sign ^ s1) as u8));
+                    t
+                }
+            };
+            acc += t;
+
+            let sign = naf2[i] >> 7;
+            let index = ((naf2[i] ^ sign) - sign) >> 1;
+            let mut t = Self::linear_pass(index as u8, &table);
+            // Negate point if either k2 or naf2[i] is negative.
+            t.conditional_negate(Choice::from(-(sign ^ s2) as u8));
+            t.x *= BETA_2;
+            acc += t;
+        }
+        // If the subscalars were even, fix result here.
+        let t = ConditionallySelectable::conditional_select(&table[0], &-table[0], Choice::from(-s1 as u8));
+        acc = G1Projective::conditional_select(&(acc - t), &acc, Choice::from(bit1));
+        table[0].x *= BETA_2;
+        let t = ConditionallySelectable::conditional_select(&table[0], &-table[0], Choice::from(-s2 as u8));
+        G1Projective::conditional_select(&(acc - t), &acc, Choice::from(bit2))
     }
 
     /// Multiply `self` by `crate::BLS_X`, using double and add.

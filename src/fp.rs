@@ -6,7 +6,7 @@ use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 use rand_core::RngCore;
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 
-use crate::util::{adc, mac, sbb, slc};
+use crate::util::{carrying_add, adc, mac, borrowing_sub, slc};
 
 pub mod wide;
 use wide::FpWide;
@@ -84,24 +84,31 @@ const fn double(v: &[u64; 6]) -> [u64; 6] {
 }
 
 #[inline]
-const fn subtract_p(v: &[u64; 6], modulus: &[u64; 6]) -> [u64; 6] {
-    let (r0, borrow) = sbb(v[0], modulus[0], 0);
-    let (r1, borrow) = sbb(v[1], modulus[1], borrow);
-    let (r2, borrow) = sbb(v[2], modulus[2], borrow);
-    let (r3, borrow) = sbb(v[3], modulus[3], borrow);
-    let (r4, borrow) = sbb(v[4], modulus[4], borrow);
-    let (r5, borrow) = sbb(v[5], modulus[5], borrow);
+const fn subtract_p<const VARTIME: bool>(v: &[u64; 6], modulus: &[u64; 6]) -> [u64; 6] {
+    let (r0, borrow) = borrowing_sub(v[0], modulus[0], false);
+    let (r1, borrow) = borrowing_sub(v[1], modulus[1], borrow);
+    let (r2, borrow) = borrowing_sub(v[2], modulus[2], borrow);
+    let (r3, borrow) = borrowing_sub(v[3], modulus[3], borrow);
+    let (r4, borrow) = borrowing_sub(v[4], modulus[4], borrow);
+    let (r5, borrow) = borrowing_sub(v[5], modulus[5], borrow);
 
     // If underflow occurred on the final limb, borrow = 0xfff...fff, otherwise
     // borrow = 0x000...000. Thus, we use it as a mask!
-    let r0 = (v[0] & borrow) | (r0 & !borrow);
-    let r1 = (v[1] & borrow) | (r1 & !borrow);
-    let r2 = (v[2] & borrow) | (r2 & !borrow);
-    let r3 = (v[3] & borrow) | (r3 & !borrow);
-    let r4 = (v[4] & borrow) | (r4 & !borrow);
-    let r5 = (v[5] & borrow) | (r5 & !borrow);
-
-    [r0, r1, r2, r3, r4, r5]
+    match VARTIME {
+        true if borrow => *v,
+        true => [r0, r1, r2, r3, r4, r5],
+        false => {
+            let borrow = borrow as u64;
+            [
+                (v[0] & borrow) | (r0 & !borrow),
+                (v[1] & borrow) | (r1 & !borrow),
+                (v[2] & borrow) | (r2 & !borrow),
+                (v[3] & borrow) | (r3 & !borrow),
+                (v[4] & borrow) | (r4 & !borrow),
+                (v[5] & borrow) | (r5 & !borrow),
+            ]
+        },
+    }
 }
 
 /// p = 4002409555221667393417789825735904156556882819939007885332058136124031650490837864442687629129015664037894272559787
@@ -212,6 +219,15 @@ impl Fp {
         R
     }
 
+    pub const fn eq_vartime(&self, rhs: &Fp) -> bool {
+        self.0[0] == rhs.0[0] &&
+        self.0[1] == rhs.0[1] &&
+        self.0[2] == rhs.0[2] &&
+        self.0[3] == rhs.0[3] &&
+        self.0[4] == rhs.0[4] &&
+        self.0[5] == rhs.0[5]
+    }
+
     pub fn is_zero(&self) -> Choice {
         self.ct_eq(&Fp::zero())
     }
@@ -229,12 +245,12 @@ impl Fp {
         tmp.0[0] = u64::from_be_bytes(<[u8; 8]>::try_from(&bytes[40..48]).unwrap());
 
         // Try to subtract the modulus
-        let (_, borrow) = sbb(tmp.0[0], MODULUS[0], 0);
-        let (_, borrow) = sbb(tmp.0[1], MODULUS[1], borrow);
-        let (_, borrow) = sbb(tmp.0[2], MODULUS[2], borrow);
-        let (_, borrow) = sbb(tmp.0[3], MODULUS[3], borrow);
-        let (_, borrow) = sbb(tmp.0[4], MODULUS[4], borrow);
-        let (_, borrow) = sbb(tmp.0[5], MODULUS[5], borrow);
+        let (_, borrow) = borrowing_sub(tmp.0[0], MODULUS[0], false);
+        let (_, borrow) = borrowing_sub(tmp.0[1], MODULUS[1], borrow);
+        let (_, borrow) = borrowing_sub(tmp.0[2], MODULUS[2], borrow);
+        let (_, borrow) = borrowing_sub(tmp.0[3], MODULUS[3], borrow);
+        let (_, borrow) = borrowing_sub(tmp.0[4], MODULUS[4], borrow);
+        let (_, borrow) = borrowing_sub(tmp.0[5], MODULUS[5], borrow);
 
         // If the element is smaller than MODULUS then the
         // subtraction will underflow, producing a borrow value
@@ -319,12 +335,12 @@ impl Fp {
         // First, because self is in Montgomery form we need to reduce it
         let tmp = self.montgomery_reduce();
 
-        let (_, borrow) = sbb(tmp[0], 0xdcff_7fff_ffff_d556, 0);
-        let (_, borrow) = sbb(tmp[1], 0x0f55_ffff_58a9_ffff, borrow);
-        let (_, borrow) = sbb(tmp[2], 0xb398_6950_7b58_7b12, borrow);
-        let (_, borrow) = sbb(tmp[3], 0xb23b_a5c2_79c2_895f, borrow);
-        let (_, borrow) = sbb(tmp[4], 0x258d_d3db_21a5_d66b, borrow);
-        let (_, borrow) = sbb(tmp[5], 0x0d00_88f5_1cbf_f34d, borrow);
+        let (_, borrow) = borrowing_sub(tmp[0], 0xdcff_7fff_ffff_d556, false);
+        let (_, borrow) = borrowing_sub(tmp[1], 0x0f55_ffff_58a9_ffff, borrow);
+        let (_, borrow) = borrowing_sub(tmp[2], 0xb398_6950_7b58_7b12, borrow);
+        let (_, borrow) = borrowing_sub(tmp[3], 0xb23b_a5c2_79c2_895f, borrow);
+        let (_, borrow) = borrowing_sub(tmp[4], 0x258d_d3db_21a5_d66b, borrow);
+        let (_, borrow) = borrowing_sub(tmp[5], 0x0d00_88f5_1cbf_f34d, borrow);
 
         // If the element was smaller, the subtraction will underflow
         // producing a borrow value of 0xffff...ffff, otherwise it will
@@ -332,7 +348,7 @@ impl Fp {
         // overflow (and so this element is not lexicographically larger
         // than its negation) and then negate it.
 
-        !Choice::from((borrow as u8) & 1)
+        !Choice::from(borrow as u8)
     }
 
     /// Constructs an element of `Fp` without checking that it is
@@ -345,10 +361,10 @@ impl Fp {
     pub const fn from_raw(v: [u64; 6]) -> Fp {
         // Attempt to subtract all possible multiples of the modulus, to ensure
         // the value is smaller than the modulus.
-        let v = subtract_p(&v, &P8);
-        let v = subtract_p(&v, &P4);
-        let v = subtract_p(&v, &P2);
-        let v = subtract_p(&v, &MODULUS);
+        let v = subtract_p::<false>(&v, &P8);
+        let v = subtract_p::<false>(&v, &P4);
+        let v = subtract_p::<false>(&v, &P2);
+        let v = subtract_p::<false>(&v, &MODULUS);
         Fp(v)
     }
 
@@ -407,7 +423,7 @@ impl Fp {
     }
 
     #[inline]
-    pub const fn add(&self, rhs: &Fp) -> Fp {
+    const fn add_helper(&self, rhs: &Fp) -> [u64; 6] {
         let (d0, carry) = adc(self.0[0], rhs.0[0], 0);
         let (d1, carry) = adc(self.0[1], rhs.0[1], carry);
         let (d2, carry) = adc(self.0[2], rhs.0[2], carry);
@@ -415,33 +431,58 @@ impl Fp {
         let (d4, carry) = adc(self.0[4], rhs.0[4], carry);
         let (d5, _) = adc(self.0[5], rhs.0[5], carry);
 
+        [d0, d1, d2, d3, d4, d5]
+    }
+
+    #[inline]
+    pub const fn add(&self, rhs: &Fp) -> Fp {
         // Attempt to subtract the modulus, to ensure the value
         // is smaller than the modulus.
-        Fp(subtract_p(&[d0, d1, d2, d3, d4, d5], &MODULUS))
+        Fp(subtract_p::<false>(&self.add_helper(rhs), &MODULUS))
+    }
+    
+    #[inline]
+    pub const fn add_vartime(&self, rhs: &Fp) -> Fp {
+        // Attempt to subtract the modulus, to ensure the value
+        // is smaller than the modulus.
+        Fp(subtract_p::<true>(&self.add_helper(rhs), &MODULUS))
+    }
+
+    #[inline]
+    const fn neg_helper(&self) -> [u64; 6] {
+        let (d0, borrow) = borrowing_sub(MODULUS[0], self.0[0], false);
+        let (d1, borrow) = borrowing_sub(MODULUS[1], self.0[1], borrow);
+        let (d2, borrow) = borrowing_sub(MODULUS[2], self.0[2], borrow);
+        let (d3, borrow) = borrowing_sub(MODULUS[3], self.0[3], borrow);
+        let (d4, borrow) = borrowing_sub(MODULUS[4], self.0[4], borrow);
+        let (d5, _) = borrowing_sub(MODULUS[5], self.0[5], borrow);
+        [ d0, d1, d2, d3, d4, d5 ]
+    }
+    #[inline]
+    pub const fn neg_vartime(&self) -> Fp {
+        if self.eq_vartime(&Fp::zero()) {
+            *self
+        } else {
+            Fp(self.neg_helper())
+        }
     }
 
     #[inline]
     pub const fn neg(&self) -> Fp {
-        let (d0, borrow) = sbb(MODULUS[0], self.0[0], 0);
-        let (d1, borrow) = sbb(MODULUS[1], self.0[1], borrow);
-        let (d2, borrow) = sbb(MODULUS[2], self.0[2], borrow);
-        let (d3, borrow) = sbb(MODULUS[3], self.0[3], borrow);
-        let (d4, borrow) = sbb(MODULUS[4], self.0[4], borrow);
-        let (d5, _) = sbb(MODULUS[5], self.0[5], borrow);
-
         // Let's use a mask if `self` was zero, which would mean
         // the result of the subtraction is p.
         let mask = (((self.0[0] | self.0[1] | self.0[2] | self.0[3] | self.0[4] | self.0[5]) == 0)
             as u64)
             .wrapping_sub(1);
 
+        let v = self.neg_helper();
         Fp([
-            d0 & mask,
-            d1 & mask,
-            d2 & mask,
-            d3 & mask,
-            d4 & mask,
-            d5 & mask,
+            v[0] & mask,
+            v[1] & mask,
+            v[2] & mask,
+            v[3] & mask,
+            v[4] & mask,
+            v[5] & mask,
         ])
     }
 
@@ -449,7 +490,7 @@ impl Fp {
     pub const fn double(&self) -> Fp {
         // Attempt to subtract the modulus, to ensure the value
         // is smaller than the modulus.
-        Fp(subtract_p(&double(&self.0), &MODULUS))
+        Fp(subtract_p::<false>(&double(&self.0), &MODULUS))
     }
 
     #[inline]
@@ -515,7 +556,7 @@ impl Fp {
 
         // Because we represent F_p elements in non-redundant form, we need a final
         // conditional subtraction to ensure the output is in range.
-        Fp(subtract_p(&[u0, u1, u2, u3, u4, u5], &MODULUS))
+        Fp(subtract_p::<false>(&[u0, u1, u2, u3, u4, u5], &MODULUS))
     }
 
     #[inline(always)]
@@ -527,7 +568,7 @@ impl Fp {
         new[3] = self.0[3];
         new[4] = self.0[4];
         new[5] = self.0[5];
-        subtract_p(&wide::montgomery_reduce_wide(&new), &MODULUS)
+        subtract_p::<false>(&wide::montgomery_reduce_wide(&new), &MODULUS)
     }
     #[inline]
     pub const fn mul(&self, rhs: &Fp) -> Fp {

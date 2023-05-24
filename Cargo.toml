@@ -12,6 +12,9 @@ repository = "https://github.com/zkcrypto/bls12_381"
 version = "0.7.1"
 edition = "2021"
 
+[lib]
+bench = false
+
 [package.metadata.docs.rs]
 rustdoc-args = [ "--html-in-header", "katex-header.html" ]
 

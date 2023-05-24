@@ -248,7 +248,7 @@ impl<const MAGNITUDE: usize> FpWide<MAGNITUDE> {
             // when f is bounded by (69 p^2 + Rp − p) / R
             // and 68p/R < 7 < 69 p/R < 8
             // means max(f) > 8p
-            subtract_p(&v, &P8)
+            subtract_p::<false>(&v, &P8)
         } else {
             v
         };
@@ -258,7 +258,7 @@ impl<const MAGNITUDE: usize> FpWide<MAGNITUDE> {
             // when f is bounded by (30 p^2 + Rp − p) / R
             // and 29p/R < 3 < 30 p/R < 4
             // means max(f) > 4p
-            subtract_p(&v, &P4)
+            subtract_p::<false>(&v, &P4)
         } else {
             v
         };
@@ -268,7 +268,7 @@ impl<const MAGNITUDE: usize> FpWide<MAGNITUDE> {
             // when f is bounded by (10 p^2 + Rp − p) / R
             // and 9p/R < 1 < 10p/R < 2
             // means max(f) > 2p
-            subtract_p(&v, &P2)
+            subtract_p::<false>(&v, &P2)
         } else {
             v
         };
@@ -276,7 +276,7 @@ impl<const MAGNITUDE: usize> FpWide<MAGNITUDE> {
         // when f is bounded by (p^2 + Rp − p) / R
         // and p/R < 1
         // means max(f) < 2p
-        Fp(subtract_p(&v, &MODULUS))
+        Fp(subtract_p::<false>(&v, &MODULUS))
     }
 }
 
@@ -447,7 +447,7 @@ where
     }
 }
 
-impl_binops_additive_output! {{MAG1 MAG2} {where FpWide<MAG1>: Ops<MAG2>} {FpWide} {FpWide}}
+impl_binops_additive_output! {{const MAG1: usize, const MAG2: usize} {where FpWide<MAG1>: Ops<MAG2>} {FpWide<MAG1>} {FpWide<MAG2>}}
 
 macro_rules! wide_double_impl {
 ($($($ua:literal),+ $(,)?)?) => {$($(

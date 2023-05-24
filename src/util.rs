@@ -12,6 +12,32 @@ pub const fn sbb(a: u64, b: u64, borrow: u64) -> (u64, u64) {
     (ret as u64, (ret >> 64) as u64)
 }
 
+/// Calculates `lhs + rhs + carry` without the ability to overflow.
+///
+/// Performs "signed ternary addition" which takes in an extra bit to add, and may return an
+/// additional bit of overflow. This signed function is used only on the highest-ordered data,
+/// for which the signed overflow result indicates whether the big integer overflowed or not.
+#[inline(always)]
+pub const fn carrying_add(lhs: u64, rhs: u64, carry: bool) -> (u64, bool) {
+    // note: longer-term this should be done via an intrinsic.
+    // note: no intermediate overflow is required (https://github.com/rust-lang/rust/issues/85532#issuecomment-1032214946).
+    let (a, b) = lhs.overflowing_add(rhs);
+    let (c, d) = a.overflowing_add(carry as u64);
+    (c, b != d)
+}
+
+/// Calculates `lhs - rhs - borrow` without the ability to overflow.
+///
+/// Performs "signed ternary subtraction" which takes in an extra bit to subtract, and may return an
+/// additional bit of overflow. This signed function is used only on the highest-ordered data,
+/// for which the signed overflow result indicates whether the big integer overflowed or not.
+#[inline(always)]
+pub const fn borrowing_sub(lhs: u64, rhs: u64, borrow: bool) -> (u64, bool) {
+    let (a, b) = lhs.overflowing_sub(rhs);
+    let (c, d) = a.overflowing_sub(borrow as u64);
+    (c, b != d)
+}
+
 /// Compute a + (b * c) + carry, returning the result and the new carry over.
 #[inline(always)]
 pub const fn mac(a: u64, b: u64, c: u64, carry: u64) -> (u64, u64) {
@@ -28,33 +54,33 @@ macro_rules! impl_add_binop {
     ($lhs:ty, $rhs:ty) => {
         impl_add_binop!{{} {} {$lhs} {$rhs}}
     };
-    ({$($lc:ident $rc:ident)?} {$(where $($wc:tt)+)?} {$($lhs:tt)+} {$($rhs:tt)+}) => {
-        impl<'b, $(const $lc: usize, const $rc: usize)?> Add<&'b $($rhs)+$(<$rc>)?> for $($lhs)+$(<$lc>)?
+    ({$($gen:tt)*} {$(where $($wc:tt)+)?} {$($lhs:tt)+} {$($rhs:tt)+}) => {
+        impl<'b, $($gen)*> Add<&'b $($rhs)+> for $($lhs)+
         $(where $($wc)+)? {
-            type Output = <&'b Self as Add<&'b $($rhs)+$(<$rc>)?>>::Output;
+            type Output = <&'b Self as Add<&'b $($rhs)+>>::Output;
 
             #[inline]
-            fn add(self, rhs: &'b $($rhs)+$(<$rc>)?) -> Self::Output {
+            fn add(self, rhs: &'b $($rhs)+) -> Self::Output {
                 &self + rhs
             }
         }
 
-        impl<'a, $(const $lc: usize, const $rc: usize)?> Add<$($rhs)+$(<$rc>)?> for &'a $($lhs)+$(<$lc>)?
+        impl<'a, $($gen)*> Add<$($rhs)+> for &'a $($lhs)+
         $(where $($wc)+)? {
-            type Output = <Self as Add<&'a $($rhs)+$(<$rc>)?>>::Output;
+            type Output = <Self as Add<&'a $($rhs)+>>::Output;
 
             #[inline]
-            fn add(self, rhs: $($rhs)+$(<$rc>)?) -> Self::Output {
+            fn add(self, rhs: $($rhs)+) -> Self::Output {
                 self + &rhs
             }
         }
 
-        impl<$(const $lc: usize, const $rc: usize)?> Add<$($rhs)+$(<$rc>)?> for $($lhs)+$(<$lc>)?
+        impl<$($gen)*> Add<$($rhs)+> for $($lhs)+
         $(where $($wc)+)? {
-            type Output = <&'static Self as Add<&'static $($rhs)+$(<$rc>)?>>::Output;
+            type Output = <&'static Self as Add<&'static $($rhs)+>>::Output;
 
             #[inline]
-            fn add(self, rhs: $($rhs)+$(<$rc>)?) -> Self::Output {
+            fn add(self, rhs: $($rhs)+) -> Self::Output {
                 &self + &rhs
             }
         }
@@ -65,33 +91,33 @@ macro_rules! impl_sub_binop {
     ($lhs:ty, $rhs:ty) => {
         impl_sub_binop!{{} {} {$lhs} {$rhs}}
     };
-    ({$($lc:ident $rc:ident)?} {$(where $($wc:tt)+)?} {$($lhs:tt)+} {$($rhs:tt)+}) => {
-        impl<'b, $(const $lc: usize, const $rc: usize)?> Sub<&'b $($rhs)+$(<$rc>)?> for $($lhs)+$(<$lc>)?
+    ({$($gen:tt)*} {$(where $($wc:tt)+)?} {$($lhs:tt)+} {$($rhs:tt)+}) => {
+        impl<'b, $($gen)*> Sub<&'b $($rhs)+> for $($lhs)+
         $(where $($wc)+)? {
-            type Output = <&'b Self as Sub<&'b $($rhs)+$(<$rc>)?>>::Output;
+            type Output = <&'b Self as Sub<&'b $($rhs)+>>::Output;
 
             #[inline]
-            fn sub(self, rhs: &'b $($rhs)+$(<$rc>)?) -> Self::Output {
+            fn sub(self, rhs: &'b $($rhs)+) -> Self::Output {
                 &self - rhs
             }
         }
 
-        impl<'a, $(const $lc: usize, const $rc: usize)?> Sub<$($rhs)+$(<$rc>)?> for &'a $($lhs)+$(<$lc>)?
+        impl<'a, $($gen)*> Sub<$($rhs)+> for &'a $($lhs)+
         $(where $($wc)+)? {
-            type Output = <Self as Sub<&'a $($rhs)+$(<$rc>)?>>::Output;
+            type Output = <Self as Sub<&'a $($rhs)+>>::Output;
 
             #[inline]
-            fn sub(self, rhs: $($rhs)+$(<$rc>)?) -> Self::Output {
+            fn sub(self, rhs: $($rhs)+) -> Self::Output {
                 self - &rhs
             }
         }
 
-        impl<$(const $lc: usize, const $rc: usize)?> Sub<$($rhs)+$(<$rc>)?> for $($lhs)+$(<$lc>)?
+        impl<$($gen)*> Sub<$($rhs)+> for $($lhs)+
         $(where $($wc)+)? {
-            type Output = <&'static Self as Sub<&'static $($rhs)+$(<$rc>)?>>::Output;
+            type Output = <&'static Self as Sub<&'static $($rhs)+>>::Output;
 
             #[inline]
-            fn sub(self, rhs: $($rhs)+$(<$rc>)?) -> Self::Output {
+            fn sub(self, rhs: $($rhs)+) -> Self::Output {
                 &self - &rhs
             }
         }
@@ -103,9 +129,9 @@ macro_rules! impl_binops_additive_output {
         impl_add_binop!($lhs, $rhs);
         impl_sub_binop!($lhs, $rhs);
     };
-    ({$lc:ident $rc:ident} {where $($wc:tt)+} {$($lhs:tt)+} {$($rhs:tt)+}) => {
-        impl_add_binop!({$lc $rc} {where $($wc)+} {$($lhs)+} {$($rhs)+});
-        impl_sub_binop!({$lc $rc} {where $($wc)+} {$($lhs)+} {$($rhs)+});
+    ({$($gen:tt)*} {where $($wc:tt)+} {$($lhs:tt)+} {$($rhs:tt)+}) => {
+        impl_add_binop!({$($gen)*} {where $($wc)+} {$($lhs)+} {$($rhs)+});
+        impl_sub_binop!({$($gen)*} {where $($wc)+} {$($lhs)+} {$($rhs)+});
     };
 }
 
