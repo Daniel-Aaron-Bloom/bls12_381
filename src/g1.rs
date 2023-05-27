@@ -9,14 +9,14 @@ use group::{
     Curve, Group, GroupEncoding, UncompressedEncoding,
 };
 use rand_core::RngCore;
-use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption, ConditionallyNegatable};
+use subtle::{Choice, ConditionallyNegatable, ConditionallySelectable, ConstantTimeEq, CtOption};
 
 #[cfg(feature = "alloc")]
 use group::WnafGroup;
 
 use crate::fp::Fp;
+use crate::util::{mac, sbb};
 use crate::Scalar;
-use crate::util::{sbb, mac};
 
 /// This is an element of $\mathbb{G}_1$ represented in the affine coordinate space.
 /// It is ideal to keep elements in this representation to reduce memory usage and
@@ -128,7 +128,7 @@ impl<'a, 'b> Add<&'b G1Projective> for &'a G1Affine {
 
     #[inline]
     fn add(self, rhs: &'b G1Projective) -> G1Projective {
-        rhs.add_mixed(self)
+        rhs.add_mixed::<false>(self)
     }
 }
 
@@ -137,7 +137,7 @@ impl<'a, 'b> Add<&'b G1Affine> for &'a G1Projective {
 
     #[inline]
     fn add(self, rhs: &'b G1Affine) -> G1Projective {
-        self.add_mixed(rhs)
+        self.add_mixed::<false>(rhs)
     }
 }
 
@@ -215,6 +215,12 @@ impl G1Affine {
             ]),
             infinity: Choice::from(0u8),
         }
+    }
+
+    /// Multiplies this point by a scalar.
+    #[inline]
+    pub fn mul<const VARTIME: bool>(self, other: &Scalar) -> G1Projective {
+        G1Projective::from(self).mul::<VARTIME>(other)
     }
 
     /// Serializes this element into compressed form. See [`notes::serialization`](crate::notes::serialization)
@@ -368,7 +374,7 @@ impl G1Affine {
             )
             .or_else(|| {
                 // Recover a y-coordinate given x by y = sqrt(x^3 + 4)
-                ((x.square() * x) + B).sqrt().and_then(|y| {
+                ((x.square::<false>() * x) + B).sqrt().and_then(|y| {
                     // Switch to the correct y-coordinate if necessary.
                     let y = Fp::conditional_select(
                         &y,
@@ -405,7 +411,7 @@ impl G1Affine {
         //
         // Check that endomorphism_p(P) == -[x^2] P
 
-        let minus_x_squared_times_p = G1Projective::from(self).mul_by_x().mul_by_x().neg();
+        let minus_x_squared_times_p = G1Projective::from(self).mul_by_x::<false>().mul_by_x::<false>().neg();
         let endomorphism_p = endomorphism(self);
         minus_x_squared_times_p.ct_eq(&G1Projective::from(endomorphism_p))
     }
@@ -414,7 +420,7 @@ impl G1Affine {
     /// true unless an "unchecked" API was used.
     pub fn is_on_curve(&self) -> Choice {
         // y^2 - x^3 ?= 4
-        (self.y.square() - (self.x.square() * self.x)).ct_eq(&B) | self.infinity
+        (self.y.square::<false>() - (self.x.square::<false>() * self.x)).ct_eq(&B) | self.infinity
     }
 }
 
@@ -434,7 +440,7 @@ const BETA_2: Fp = Fp::from_raw_unchecked([
     0x5870_42AF_D385_1B95,
     0x8EB6_0EBE_01BA_CB9E,
     0x03F9_7D6E_83D0_50D2,
-    0x18F0_2065_5463_8741
+    0x18F0_2065_5463_8741,
 ]);
 
 // The recoding width that determines the length and size of precomputation table.
@@ -476,10 +482,10 @@ const fn mul_short(a: &[u64; 4], b: &[u64; 4]) -> [u64; 8] {
     [r0, r1, r2, r3, r4, r5, r6, 0]
 }
 
-fn glv_recoding(k: &[u8; 32]) -> (i8,[u8;32],i8,[u8;32]) {
+fn glv_recoding(k: &[u8; 32]) -> (i8, [u8; 32], i8, [u8; 32]) {
     const V: [[u64; 4]; 2] = [
         [0x63f6_e522_f6cf_ee2f, 0x7c6b_ecf1_e01f_aadd, 1, 0],
-        [0x0000_0000_ffff_ffff, 0xac45_a401_0001_a402, 0, 0]
+        [0x0000_0000_ffff_ffff, 0xac45_a401_0001_a402, 0, 0],
     ];
 
     let t: [u64; 4] = [
@@ -510,7 +516,7 @@ fn regular_recoding(naf: &mut [i8; 128], sc: &mut [u8; 32]) {
     let w = G1_WIDTH;
     // Joux-Tunstall regular recoding algorithm for parameterized w.
     let mask = (1 << w) - 1;
-    let len = 2 + (naf.len()-1)/(w - 1) as usize;
+    let len = 2 + (naf.len() - 1) / (w - 1) as usize;
 
     for i in 0..(len - 1) {
         naf[i] = ((sc[0] & mask) as i8) - (1 << (w - 1));
@@ -522,7 +528,7 @@ fn regular_recoding(naf: &mut [i8; 128], sc: &mut [u8; 32]) {
         sc[31] >>= w - 1;
     }
     naf[len - 1] = sc[0] as i8;
-}   
+}
 
 fn endomorphism(p: &G1Affine) -> G1Affine {
     // Endomorphism of the points on the curve.
@@ -637,7 +643,7 @@ impl<'a, 'b> Add<&'b G1Projective> for &'a G1Projective {
 
     #[inline]
     fn add(self, rhs: &'b G1Projective) -> G1Projective {
-        self.add(rhs)
+        self.add::<false>(rhs)
     }
 }
 
@@ -691,10 +697,10 @@ impl_binops_multiplicative_mixed!(Scalar, G1Affine, G1Projective);
 impl_binops_multiplicative_mixed!(Scalar, G1Projective, G1Projective);
 
 #[inline(always)]
-fn mul_by_3b(a: Fp) -> Fp {
-    let a = a.double(); // 2
-    let a = a.double(); // 4
-    a.double() + a // 12
+fn mul_by_3b<const VARTIME: bool>(a: Fp) -> Fp {
+    let a = a.double::<VARTIME>(); // 2
+    let a = a.double::<VARTIME>(); // 4
+    a.double::<VARTIME>() + a // 12
 }
 
 impl G1Projective {
@@ -732,39 +738,47 @@ impl G1Projective {
     }
 
     /// Computes the doubling of this point.
-    pub fn double(&self) -> G1Projective {
+    pub fn double<const VARTIME: bool>(&self) -> G1Projective {
         // Algorithm 9, https://eprint.iacr.org/2015/1060.pdf
 
-        let t0 = self.y.square();
-        let z3 = t0.double();
-        let z3 = z3.double();
-        let z3 = z3.double();
+        let t0 = self.y.square::<VARTIME>();
+        let z3 = t0.double::<VARTIME>();
+        let z3 = z3.double::<VARTIME>();
+        let z3 = z3.double::<VARTIME>();
         let t1 = self.y * self.z;
-        let t2 = self.z.square();
-        let t2 = mul_by_3b(t2);
+        let t2 = self.z.square::<VARTIME>();
+        let t2 = mul_by_3b::<VARTIME>(t2);
         let x3 = t2.mul_unreduced(&z3); // t2 * z3
         let y3 = t0 + t2;
         let z3 = t1 * z3;
-        let t1 = t2.double();
+        let t1 = t2.double::<VARTIME>();
         let t2 = t1 + t2;
         let t0 = t0 - t2;
         let y3 = t0.mul_unreduced(&y3); // t0 * y3
         let y3 = x3 + y3;
         let t1 = self.x * self.y;
         let x3 = t0 * t1;
-        let x3 = x3.double();
+        let x3 = x3.double::<VARTIME>();
 
         let tmp = G1Projective {
             x: x3,
-            y: y3.montgomery_reduce(),
+            y: y3.montgomery_reduce::<VARTIME>(),
             z: z3,
         };
 
-        G1Projective::conditional_select(&tmp, &G1Projective::identity(), self.is_identity())
+        if VARTIME {
+            if self.is_identity_vartime() {
+                G1Projective::identity()
+            } else {
+                tmp
+            }
+        } else {
+            G1Projective::conditional_select(&tmp, self, self.is_identity())
+        }
     }
 
     /// Adds this point to another point.
-    pub fn add(&self, rhs: &G1Projective) -> G1Projective {
+    pub fn add<const VARTIME: bool>(&self, rhs: &G1Projective) -> G1Projective {
         // Algorithm 7, https://eprint.iacr.org/2015/1060.pdf
 
         let t0 = self.x * rhs.x;
@@ -785,12 +799,12 @@ impl G1Projective {
         let x3 = x3 * y3;
         let y3 = t0 + t2;
         let y3 = x3 - y3;
-        let x3 = t0.double();
+        let x3 = t0.double::<VARTIME>();
         let t0 = x3 + t0;
-        let t2 = mul_by_3b(t2);
+        let t2 = mul_by_3b::<VARTIME>(t2);
         let z3 = t1 + t2;
         let t1 = t1 - t2;
-        let y3 = mul_by_3b(y3);
+        let y3 = mul_by_3b::<VARTIME>(y3);
         let x3 = t4.mul_unreduced(&y3); // t4 * y3
         let t2 = t3.mul_unreduced(&t1); // t3 * t1
         let x3 = t2 - x3;
@@ -802,14 +816,14 @@ impl G1Projective {
         let z3 = z3 + t0;
 
         G1Projective {
-            x: x3.montgomery_reduce(),
-            y: y3.montgomery_reduce(),
-            z: z3.montgomery_reduce(),
+            x: x3.montgomery_reduce::<VARTIME>(),
+            y: y3.montgomery_reduce::<VARTIME>(),
+            z: z3.montgomery_reduce::<VARTIME>(),
         }
     }
 
     /// Adds this point to another point in the affine model.
-    pub fn add_mixed(&self, rhs: &G1Affine) -> G1Projective {
+    pub fn add_mixed<const VARTIME: bool>(&self, rhs: &G1Affine) -> G1Projective {
         // Algorithm 8, https://eprint.iacr.org/2015/1060.pdf
 
         let t0 = self.x * rhs.x;
@@ -823,12 +837,12 @@ impl G1Projective {
         let t4 = t4 + self.y;
         let y3 = rhs.x * self.z;
         let y3 = y3 + self.x;
-        let x3 = t0.double();
+        let x3 = t0.double::<VARTIME>();
         let t0 = x3 + t0;
-        let t2 = mul_by_3b(self.z);
+        let t2 = mul_by_3b::<VARTIME>(self.z);
         let z3 = t1 + t2;
         let t1 = t1 - t2;
-        let y3 = mul_by_3b(y3);
+        let y3 = mul_by_3b::<VARTIME>(y3);
         let x3 = t4.mul_unreduced(&y3); // t4 * y3
         let t2 = t3.mul_unreduced(&t1); // t3 * t1
         let x3 = t2 - x3;
@@ -840,21 +854,35 @@ impl G1Projective {
         let z3 = z3 + t0;
 
         let tmp = G1Projective {
-            x: x3.montgomery_reduce(),
-            y: y3.montgomery_reduce(),
-            z: z3.montgomery_reduce(),
+            x: x3.montgomery_reduce::<VARTIME>(),
+            y: y3.montgomery_reduce::<VARTIME>(),
+            z: z3.montgomery_reduce::<VARTIME>(),
         };
 
-        G1Projective::conditional_select(&tmp, self, rhs.is_identity())
+        if VARTIME {
+            if self.is_identity_vartime() {
+                G1Projective::identity()
+            } else {
+                tmp
+            }
+        } else {
+            G1Projective::conditional_select(&tmp, self, rhs.is_identity())
+        }
+    }
+
+    /// Multiplies this point by a scalar.
+    #[inline]
+    pub fn mul<const VARTIME: bool>(self, other: &Scalar) -> G1Projective {
+        self.multiply::<VARTIME>(&other.to_bytes())
     }
 
     //fn precompute(&self) -> [G1Affine; 1 << (G1_WIDTH - 2)] {
-    fn precompute(&self) -> [G1Projective; 1 << (G1_WIDTH - 2)] {
+    fn precompute<const VARTIME: bool>(&self) -> [G1Projective; 1 << (G1_WIDTH - 2)] {
         // Size of precomputation table is 2^(w-2).
         //let mut table = [G1Affine::from(self); 1 << (G1_WIDTH - 2)];
         let mut proj_table = [*self; 1 << (G1_WIDTH - 2)];
         if G1_WIDTH > 2 {
-            let double_point = self.double();
+            let double_point = self.double::<VARTIME>();
             let mut prev = *self;
             for i in proj_table.iter_mut().skip(1) {
                 prev += double_point;
@@ -866,11 +894,17 @@ impl G1Projective {
         //table
     }
 
-    fn linear_pass<T: Default+ConditionallySelectable>(index: u8, table: &[T]) -> T {
+    fn linear_pass<T: Default + ConditionallySelectable, const VARTIME: bool>(index: u8, table: &[T]) -> T {
         // Scan table of points to read table[index]
         let mut tmp = table[0];
         for (j, jv) in table.iter().enumerate().skip(1) {
-            tmp.conditional_assign(jv, (j as u8).ct_eq(&index));
+            if VARTIME {
+                if j as u8 == index {
+                    tmp = *jv;
+                }
+            } else {
+                tmp.conditional_assign(jv, (j as u8).ct_eq(&index));
+            }
         }
         tmp
     }
@@ -878,15 +912,37 @@ impl G1Projective {
     fn multiply<const VARTIME: bool>(&self, by: &[u8; 32]) -> G1Projective {
         let mut acc = G1Projective::identity();
 
+        if VARTIME {
+            // This is a simple double-and-add implementation of point
+            // multiplication, moving from most significant to least
+            // significant bit of the scalar.
+            //
+            // We skip the leading bit because it's always unset for Fq
+            // elements.
+            for bit in by
+                .iter()
+                .rev()
+                .flat_map(|byte| (0..8).rev().map(move |i| (byte >> i) & 1u8))
+                .skip(1)
+            {   
+                acc = acc.double::<VARTIME>();
+                if bit == 1 {
+                    acc += self;
+                }
+            }
+    
+            return acc
+        }
+
         // Length of recoding is ceil(scalar bitlength, w - 1).
-        let len = 2 + (128-1)/(G1_WIDTH - 1) as usize;
+        let len = 2 + (128 - 1) / (G1_WIDTH - 1) as usize;
 
         // Allocate longest possible vector, recode scalar and precompute table.
         let mut naf1 = [0 as i8; 128];
         let mut naf2 = [0 as i8; 128];
         let (s1, mut k1, s2, mut k2) = glv_recoding(&by);
-        let mut table = self.precompute();
-        
+        let mut table = self.precompute::<VARTIME>();
+
         let bit1 = k1[0] & 1u8;
         k1[0] |= 1;
         let bit2 = k2[0] & 1u8;
@@ -897,7 +953,7 @@ impl G1Projective {
 
         for i in (0..len).rev() {
             for _ in 1..G1_WIDTH {
-                acc = acc.double();
+                acc = acc.double::<VARTIME>();
             }
             let sign = naf1[i] >> 7;
             let index = ((naf1[i] ^ sign) - sign) >> 1;
@@ -906,7 +962,7 @@ impl G1Projective {
                 true if sign != s1 => -table[index as usize],
                 true => table[index as usize],
                 false => {
-                    let mut t = Self::linear_pass(index as u8, &table);
+                    let mut t = Self::linear_pass::<_, VARTIME>(index as u8, &table);
                     // Negate point if either k1 or naf1[i] is negative.
                     t.conditional_negate(Choice::from(-(sign ^ s1) as u8));
                     t
@@ -916,28 +972,36 @@ impl G1Projective {
 
             let sign = naf2[i] >> 7;
             let index = ((naf2[i] ^ sign) - sign) >> 1;
-            let mut t = Self::linear_pass(index as u8, &table);
+            let mut t = Self::linear_pass::<_, VARTIME>(index as u8, &table);
             // Negate point if either k2 or naf2[i] is negative.
             t.conditional_negate(Choice::from(-(sign ^ s2) as u8));
             t.x *= BETA_2;
             acc += t;
         }
         // If the subscalars were even, fix result here.
-        let t = ConditionallySelectable::conditional_select(&table[0], &-table[0], Choice::from(-s1 as u8));
+        let t = ConditionallySelectable::conditional_select(
+            &table[0],
+            &-table[0],
+            Choice::from(-s1 as u8),
+        );
         acc = G1Projective::conditional_select(&(acc - t), &acc, Choice::from(bit1));
         table[0].x *= BETA_2;
-        let t = ConditionallySelectable::conditional_select(&table[0], &-table[0], Choice::from(-s2 as u8));
+        let t = ConditionallySelectable::conditional_select(
+            &table[0],
+            &-table[0],
+            Choice::from(-s2 as u8),
+        );
         G1Projective::conditional_select(&(acc - t), &acc, Choice::from(bit2))
     }
 
     /// Multiply `self` by `crate::BLS_X`, using double and add.
-    fn mul_by_x(&self) -> G1Projective {
+    fn mul_by_x<const VARTIME: bool>(&self) -> G1Projective {
         let mut xself = G1Projective::identity();
         // NOTE: in BLS12-381 we can just skip the first bit.
         let mut x = crate::BLS_X >> 1;
         let mut tmp = *self;
         while x != 0 {
-            tmp = tmp.double();
+            tmp = tmp.double::<VARTIME>();
 
             if x % 2 == 1 {
                 xself += tmp;
@@ -954,8 +1018,8 @@ impl G1Projective {
     /// Multiplies by $(1 - z)$, where $z$ is the parameter of BLS12-381, which
     /// [suffices to clear](https://ia.cr/2019/403) the cofactor and map
     /// elliptic curve points to elements of $\mathbb{G}\_1$.
-    pub fn clear_cofactor(&self) -> G1Projective {
-        self - self.mul_by_x()
+    pub fn clear_cofactor<const VARTIME: bool>(&self) -> G1Projective {
+        self - self.mul_by_x::<VARTIME>()
     }
 
     /// Converts a batch of `G1Projective` elements into `G1Affine` elements. This
@@ -1001,15 +1065,21 @@ impl G1Projective {
         self.z.is_zero()
     }
 
+    /// Returns true if this element is the identity (the point at infinity).
+    #[inline]
+    pub fn is_identity_vartime(&self) -> bool {
+        self.z.is_zero_vartime()
+    }
+
     /// Returns true if this point is on the curve. This should always return
     /// true unless an "unchecked" API was used.
     pub fn is_on_curve(&self) -> Choice {
         // Y^2 Z = X^3 + b Z^3
 
-        let lhs = self.y.square() * self.z;
-        let rhs = (self.x.square().mul_unreduced(&self.x)
-            + self.z.square().mul_unreduced(&(self.z * B)))
-        .montgomery_reduce();
+        let lhs = self.y.square::<false>() * self.z;
+        let rhs = (self.x.square::<false>().mul_unreduced(&self.x)
+            + self.z.square::<false>().mul_unreduced(&(self.z * B)))
+        .montgomery_reduce::<false>();
         lhs.ct_eq(&rhs) | self.z.is_zero()
     }
 }
@@ -1111,14 +1181,14 @@ impl Group for G1Projective {
             let flip_sign = rng.next_u32() % 2 != 0;
 
             // Obtain the corresponding y-coordinate given x as y = sqrt(x^3 + 4)
-            let p = ((x.square() * x) + B).sqrt().map(|y| G1Affine {
+            let p = ((x.square::<false>() * x) + B).sqrt().map(|y| G1Affine {
                 x,
                 y: if flip_sign { -y } else { y },
                 infinity: 0.into(),
             });
 
             if p.is_some().into() {
-                let p = p.unwrap().to_curve().clear_cofactor();
+                let p = p.unwrap().to_curve().clear_cofactor::<false>();
 
                 if bool::from(!p.is_identity()) {
                     return p;
@@ -1141,7 +1211,7 @@ impl Group for G1Projective {
 
     #[must_use]
     fn double(&self) -> Self {
-        self.double()
+        self.double::<false>()
     }
 }
 
@@ -1422,12 +1492,12 @@ fn test_affine_to_projective() {
 #[test]
 fn test_doubling() {
     {
-        let tmp = G1Projective::identity().double();
+        let tmp = G1Projective::identity().double::<false>();
         assert!(bool::from(tmp.is_identity()));
         assert!(bool::from(tmp.is_on_curve()));
     }
     {
-        let tmp = G1Projective::generator().double();
+        let tmp = G1Projective::generator().double::<false>();
         assert!(!bool::from(tmp.is_identity()));
         assert!(bool::from(tmp.is_on_curve()));
 
@@ -1514,8 +1584,8 @@ fn test_projective_addition() {
         assert!(c == G1Projective::generator());
     }
     {
-        let a = G1Projective::generator().double().double(); // 4P
-        let b = G1Projective::generator().double(); // 2P
+        let a = G1Projective::generator().double::<false>().double::<false>(); // 4P
+        let b = G1Projective::generator().double::<false>(); // 2P
         let c = a + b;
 
         let mut d = G1Projective::generator();
@@ -1539,8 +1609,8 @@ fn test_projective_addition() {
             0x03f9_7d6e_83d0_50d2,
             0x18f0_2065_5463_8741,
         ]);
-        let beta = beta.square();
-        let a = G1Projective::generator().double().double();
+        let beta = beta.square::<false>();
+        let a = G1Projective::generator().double::<false>().double::<false>();
         let b = G1Projective {
             x: a.x * beta,
             y: -a.y,
@@ -1635,8 +1705,8 @@ fn test_mixed_addition() {
         assert!(c == G1Projective::generator());
     }
     {
-        let a = G1Projective::generator().double().double(); // 4P
-        let b = G1Projective::generator().double(); // 2P
+        let a = G1Projective::generator().double::<false>().double::<false>(); // 4P
+        let b = G1Projective::generator().double::<false>(); // 2P
         let c = a + b;
 
         let mut d = G1Projective::generator();
@@ -1660,8 +1730,8 @@ fn test_mixed_addition() {
             0x03f9_7d6e_83d0_50d2,
             0x18f0_2065_5463_8741,
         ]);
-        let beta = beta.square();
-        let a = G1Projective::generator().double().double();
+        let beta = beta.square::<false>();
+        let a = G1Projective::generator().double::<false>().double::<false>();
         let b = G1Projective {
             x: a.x * beta,
             y: -a.y,
@@ -1702,7 +1772,7 @@ fn test_mixed_addition() {
 #[test]
 #[allow(clippy::eq_op)]
 fn test_projective_negation_and_subtraction() {
-    let a = G1Projective::generator().double();
+    let a = G1Projective::generator().double::<false>();
     assert_eq!(a + (-a), G1Projective::identity());
     assert_eq!(a + (-a), a - a);
 }
@@ -1791,10 +1861,10 @@ fn test_mul_by_x() {
     } else {
         Scalar::from(crate::BLS_X)
     };
-    assert_eq!(generator.mul_by_x(), generator * x);
+    assert_eq!(generator.mul_by_x::<false>(), generator * x);
 
     let point = G1Projective::generator() * Scalar::from(42);
-    assert_eq!(point.mul_by_x(), point * x);
+    assert_eq!(point.mul_by_x::<false>(), point * x);
 }
 
 #[test]
@@ -1802,9 +1872,9 @@ fn test_clear_cofactor() {
     // the generator (and the identity) are always on the curve,
     // even after clearing the cofactor
     let generator = G1Projective::generator();
-    assert!(bool::from(generator.clear_cofactor().is_on_curve()));
+    assert!(bool::from(generator.clear_cofactor::<false>().is_on_curve()));
     let id = G1Projective::identity();
-    assert!(bool::from(id.clear_cofactor().is_on_curve()));
+    assert!(bool::from(id.clear_cofactor::<false>().is_on_curve()));
 
     let z = Fp::from_raw_unchecked([
         0x3d2d1c670671394e,
@@ -1832,26 +1902,26 @@ fn test_clear_cofactor() {
             0xb0c8cfbe9dc8fdc1,
             0x1328661767ef368b,
         ]),
-        z: z.square() * z,
+        z: z.square::<false>() * z,
     };
 
     assert!(bool::from(point.is_on_curve()));
     assert!(!bool::from(G1Affine::from(point).is_torsion_free()));
-    let cleared_point = point.clear_cofactor();
+    let cleared_point = point.clear_cofactor::<false>();
     assert!(bool::from(cleared_point.is_on_curve()));
     assert!(bool::from(G1Affine::from(cleared_point).is_torsion_free()));
 
     // in BLS12-381 the cofactor in G1 can be
     // cleared multiplying by (1-x)
     let h_eff = Scalar::from(1) + Scalar::from(crate::BLS_X);
-    assert_eq!(point.clear_cofactor(), point * h_eff);
+    assert_eq!(point.clear_cofactor::<false>(), point * h_eff);
 }
 
 #[test]
 fn test_batch_normalize() {
-    let a = G1Projective::generator().double();
-    let b = a.double();
-    let c = b.double();
+    let a = G1Projective::generator().double::<false>();
+    let b = a.double::<false>();
+    let c = b.double::<false>();
 
     for a_identity in (0..=1).map(|n| n == 1) {
         for b_identity in (0..=1).map(|n| n == 1) {

@@ -113,15 +113,15 @@ impl Fp12 {
         }
     }
 
-    pub fn mul_by_014(&self, c0: &Fp2, c1: &Fp2, c4: &Fp2) -> Fp12 {
-        let aa = self.c0.mul_by_01(c0, c1);
-        let bb = self.c1.mul_by_1(c4);
+    pub fn mul_by_014<const VARTIME: bool>(&self, c0: &Fp2, c1: &Fp2, c4: &Fp2) -> Fp12 {
+        let aa = self.c0.mul_by_01::<VARTIME>(c0, c1);
+        let bb = self.c1.mul_by_1::<VARTIME>(c4);
         let o = c1 + c4;
         let c1 = self.c1 + self.c0;
-        let c1 = c1.mul_by_01(c0, &o);
+        let c1 = c1.mul_by_01::<VARTIME>(c0, &o);
         let c1 = c1 - aa - bb;
         let c0 = bb;
-        let c0 = c0.mul_by_nonresidue();
+        let c0 = c0.mul_by_nonresidue::<VARTIME>();
         let c0 = c0 + aa;
 
         Fp12 { c0, c1 }
@@ -133,18 +133,26 @@ impl Fp12 {
     }
 
     #[inline(always)]
-    pub fn conjugate(&self) -> Self {
+    pub fn conjugate<const VARTIME: bool>(&self) -> Self {
         Fp12 {
             c0: self.c0,
-            c1: -self.c1,
+            c1: (&self.c1).neg::<VARTIME>(),
+        }
+    }
+
+    #[inline]
+    pub fn neg<const VARTIME: bool>(&self) -> Self {
+        Fp12 {
+            c0: (&self.c0).neg::<VARTIME>(),
+            c1: (&self.c1).neg::<VARTIME>(),
         }
     }
 
     /// Raises this element to p.
     #[inline(always)]
-    pub fn frobenius_map(&self) -> Self {
-        let c0 = self.c0.frobenius_map();
-        let c1 = self.c1.frobenius_map();
+    pub fn frobenius_map<const VARTIME: bool>(&self) -> Self {
+        let c0 = self.c0.frobenius_map::<VARTIME>();
+        let c1 = self.c1.frobenius_map::<VARTIME>();
 
         // c1 = c1 * (u + 1)^((p - 1) / 6)
         let c1 = c1
@@ -171,21 +179,36 @@ impl Fp12 {
     }
 
     #[inline]
-    pub fn square(&self) -> Self {
+    pub fn square<const VARTIME: bool>(&self) -> Self {
         let ab = self.c0 * self.c1;
         let c0c1 = self.c0 + self.c1;
-        let c0 = self.c1.mul_by_nonresidue();
+        let c0 = self.c1.mul_by_nonresidue::<VARTIME>();
         let c0 = c0 + self.c0;
         let c0 = c0 * c0c1;
         let c0 = c0 - ab;
         let c1 = ab + ab;
-        let c0 = c0 - ab.mul_by_nonresidue();
+        let c0 = c0 - ab.mul_by_nonresidue::<VARTIME>();
+
+        Fp12 { c0, c1 }
+    }
+
+    #[inline]
+    fn mul<const VARTIME: bool>(&self, other: &Fp12) -> Self {
+        let aa = self.c0 * other.c0;
+        let bb = self.c1 * other.c1;
+        let o = other.c0 + other.c1;
+        let c1 = self.c1 + self.c0;
+        let c1 = c1 * o;
+        let c1 = c1 - aa;
+        let c1 = c1 - bb;
+        let c0 = bb.mul_by_nonresidue::<VARTIME>();
+        let c0 = c0 + aa;
 
         Fp12 { c0, c1 }
     }
 
     pub fn invert(&self) -> CtOption<Self> {
-        (self.c0.square() - self.c1.square().mul_by_nonresidue())
+        (self.c0.square::<false>() - self.c1.square::<false>().mul_by_nonresidue::<false>())
             .invert()
             .map(|t| Fp12 {
                 c0: self.c0 * t,
@@ -199,17 +222,7 @@ impl<'a, 'b> Mul<&'b Fp12> for &'a Fp12 {
 
     #[inline]
     fn mul(self, other: &'b Fp12) -> Self::Output {
-        let aa = self.c0 * other.c0;
-        let bb = self.c1 * other.c1;
-        let o = other.c0 + other.c1;
-        let c1 = self.c1 + self.c0;
-        let c1 = c1 * o;
-        let c1 = c1 - aa;
-        let c1 = c1 - bb;
-        let c0 = bb.mul_by_nonresidue();
-        let c0 = c0 + aa;
-
-        Fp12 { c0, c1 }
+        self.mul::<false>(other)
     }
 }
 
@@ -614,15 +627,15 @@ fn test_arithmetic() {
     // because a and b and c are similar to each other and
     // I was lazy, this is just some arbitrary way to make
     // them a little more different
-    let a = a.square().invert().unwrap().square() + c;
-    let b = b.square().invert().unwrap().square() + a;
-    let c = c.square().invert().unwrap().square() + b;
+    let a = a.square::<false>().invert().unwrap().square::<false>() + c;
+    let b = b.square::<false>().invert().unwrap().square::<false>() + a;
+    let c = c.square::<false>().invert().unwrap().square::<false>() + b;
 
-    assert_eq!(a.square(), a * a);
-    assert_eq!(b.square(), b * b);
-    assert_eq!(c.square(), c * c);
+    assert_eq!(a.square::<false>(), a * a);
+    assert_eq!(b.square::<false>(), b * b);
+    assert_eq!(c.square::<false>(), c * c);
 
-    assert_eq!((a + b) * c.square(), (c * c * a) + (c * c * b));
+    assert_eq!((a + b) * c.square::<false>(), (c * c * a) + (c * c * b));
 
     assert_eq!(
         a.invert().unwrap() * b.invert().unwrap(),
@@ -630,21 +643,21 @@ fn test_arithmetic() {
     );
     assert_eq!(a.invert().unwrap() * a, Fp12::one());
 
-    assert!(a != a.frobenius_map());
+    assert!(a != a.frobenius_map::<false>());
     assert_eq!(
         a,
-        a.frobenius_map()
-            .frobenius_map()
-            .frobenius_map()
-            .frobenius_map()
-            .frobenius_map()
-            .frobenius_map()
-            .frobenius_map()
-            .frobenius_map()
-            .frobenius_map()
-            .frobenius_map()
-            .frobenius_map()
-            .frobenius_map()
+        a.frobenius_map::<false>()
+            .frobenius_map::<false>()
+            .frobenius_map::<false>()
+            .frobenius_map::<false>()
+            .frobenius_map::<false>()
+            .frobenius_map::<false>()
+            .frobenius_map::<false>()
+            .frobenius_map::<false>()
+            .frobenius_map::<false>()
+            .frobenius_map::<false>()
+            .frobenius_map::<false>()
+            .frobenius_map::<false>()
     );
 }
 

@@ -5,6 +5,8 @@ use crate::{
     util::{adc, mac, sbb, slc},
 };
 
+use super::{Mag, Never, NonZero, Ops};
+
 #[inline(always)]
 /// The return value is bounded by $(mp^2 + Rp − p) / R$
 /// where $mp^2$ is the modulus of `v`. This means `m` must be 87 or lower, as
@@ -229,6 +231,15 @@ const fn negate_wide(v: &[u64; 12], modulus: &[u64; 12]) -> [u64; 12] {
     [d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11]
 }
 
+pub trait MulOp<const MAG: usize>: Mag<[u64; 6]> {
+    type MulOut;
+    fn mul(lhs: &Self, rhs: &Self::Mag<MAG>) -> Self::MulOut;
+}
+pub trait SquareOp: Mag<[u64; 6]> {
+    type SquareOut;
+    fn square(lhs: &Self) -> Self::SquareOut;
+}
+
 /// The unreduced result of `Fp` multiplication.
 /// The internal representation of this type is twelve 64-bit unsigned
 /// integers in little-endian order. `FpWide` values are always in
@@ -239,46 +250,68 @@ pub struct FpWide<const MAGNITUDE: usize>([u64; 12]);
 // MAGNITUDE cannot be above 87, or else
 impl<const MAGNITUDE: usize> FpWide<MAGNITUDE> {
     #[inline(always)]
-    pub const fn montgomery_reduce(self) -> Fp {
+    pub const fn montgomery_reduce<const VARTIME: bool>(self) -> Fp {
         use super::{subtract_p, MODULUS, P2, P4, P8};
-        let v = montgomery_reduce_wide(&self.0);
+        let mut v = montgomery_reduce_wide(&self.0);
 
-        let v = if MAGNITUDE >= 68 {
+        if MAGNITUDE >= 68 {
             // 68 indicates a mod of 69 p^2
             // when f is bounded by (69 p^2 + Rp − p) / R
             // and 68p/R < 7 < 69 p/R < 8
             // means max(f) > 8p
-            subtract_p::<false>(&v, &P8)
-        } else {
-            v
-        };
+            v = subtract_p::<VARTIME>(&v, &P8)
+        }
 
-        let v = if MAGNITUDE >= 29 {
+        if MAGNITUDE >= 29 {
             // 29 indicates a mod of 30 p^2
             // when f is bounded by (30 p^2 + Rp − p) / R
             // and 29p/R < 3 < 30 p/R < 4
             // means max(f) > 4p
-            subtract_p::<false>(&v, &P4)
-        } else {
-            v
-        };
+            v = subtract_p::<VARTIME>(&v, &P4)
+        }
 
-        let v = if MAGNITUDE >= 9 {
+        if MAGNITUDE >= 9 {
             // 9 indicates a mod of 10 p^2
             // when f is bounded by (10 p^2 + Rp − p) / R
             // and 9p/R < 1 < 10p/R < 2
             // means max(f) > 2p
-            subtract_p::<false>(&v, &P2)
-        } else {
-            v
-        };
+            v = subtract_p::<VARTIME>(&v, &P2)
+        }
 
         // when f is bounded by (p^2 + Rp − p) / R
         // and p/R < 1
         // means max(f) < 2p
-        Fp(subtract_p::<false>(&v, &MODULUS))
+        Fp(subtract_p::<VARTIME>(&v, &MODULUS))
     }
 }
+macro_rules! mul_helper {
+    ($ua:literal {$($ub:literal)*}) => {
+$(
+impl MulOp<$ub> for Fp<$ua> {
+    type MulOut = FpWide<{($ua+1)*($ub+1)-1}>;
+    fn mul(lhs: &Self, rhs: &Self::Mag<$ub>) -> Self::MulOut {
+        FpWide(mul_wide(&lhs.0, &rhs.0))
+    }
+})*
+impl SquareOp for Fp<$ua> {
+    type SquareOut = FpWide<{($ua+1)*($ua+1)-1}>;
+    fn square(lhs: &Self) -> Self::SquareOut {
+        FpWide(square_wide(&lhs.0))
+    }
+}
+    };
+    ({$($ua:literal)*} $ub:tt) => {$(
+        mul_helper!{$ua $ub}
+    )*};
+}
+
+macro_rules! mul_impl {
+    ($($($ua:literal),+ $(,)?)?) => {
+        mul_helper!{{$($($ua)+)?} {$($($ua)+)?}}
+    };
+}
+
+mul_impl!{0,1,2,3,4,5,6,7,8}
 
 impl FpWide<0> {
     #[inline(always)]
@@ -292,64 +325,30 @@ impl FpWide<0> {
     }
 }
 
-// Hack to get the ! type on stable
-pub trait HasOutput {
-    type Output;
-}
-impl<O> HasOutput for fn() -> O {
-    type Output = O;
-}
-type Never = <fn() -> ! as HasOutput>::Output;
 
 const MODULUS_INCREMENT: [u64; 12] = square_wide(&super::MODULUS);
 
-pub trait Wide: Sized {
-    type Prev: Wide;
-    type Next: Wide;
+macro_rules! wide_impl {
+    ($($($ua:literal),+ $(,)?)?) => {$($(
+impl Mag<[u64; 12]> for FpWide<$ua> {
+    type Prev = FpWide<{$ua - 1}>;
+    type Next = FpWide<{$ua + 1}>;
+    type Mag<const MAGNITUDE: usize> = FpWide<MAGNITUDE>;
 
     /// A multiple of the prime that is larger than this element could be (p^2).
     const MODULUS: [u64; 12] = add_wide(&Self::Prev::MODULUS, &MODULUS_INCREMENT);
 
-    fn make(v: [u64; 12]) -> Self;
-    fn data(&self) -> &[u64; 12];
-
-    /// Negates an element by subtracting it from the `Self::MODULUS`
-    #[inline(always)]
-    fn negate(&self) -> Self {
-        Self::make(negate_wide(self.data(), &Self::MODULUS))
-    }
-}
-
-pub trait NonZero {}
-
-impl Wide for Never {
-    type Prev = Never;
-    type Next = Never;
-    const MODULUS: [u64; 12] = [0; 12];
-
-    #[inline(always)]
-    fn make(_: [u64; 12]) -> Self {
-        unimplemented!()
-    }
-    #[inline(always)]
-    fn data(&self) -> &[u64; 12] {
-        unreachable!()
-    }
-}
-
-macro_rules! wide_impl {
-    ($($($ua:literal),+ $(,)?)?) => {$($(
-impl Wide for FpWide<$ua> {
-    type Prev = FpWide<{$ua - 1}>;
-    type Next = FpWide<{$ua + 1}>;
-
     #[inline(always)]
     fn make(v: [u64; 12]) -> Self {
-        FpWide(v)
+        Self(v)
     }
     #[inline(always)]
     fn data(&self) -> &[u64; 12] {
         &self.0
+    }
+    #[inline(always)]
+    fn negate(&self) -> Self {
+        Self::make(negate_wide(self.data(), &Self::MODULUS))
     }
 }
 
@@ -357,97 +356,123 @@ impl NonZero for FpWide<$ua> {}
     )+)?};
 }
 
-impl Wide for FpWide<0> {
+impl Mag<[u64; 12]> for FpWide<0> {
     type Prev = Never;
     type Next = FpWide<1>;
+    type Mag<const MAGNITUDE: usize> = FpWide<MAGNITUDE>;
+
+    /// A multiple of the prime that is larger than this element could be (p^2).
+    const MODULUS: [u64; 12] = MODULUS_INCREMENT;
 
     #[inline(always)]
     fn make(v: [u64; 12]) -> Self {
-        FpWide(v)
+        Self(v)
     }
     #[inline(always)]
     fn data(&self) -> &[u64; 12] {
         &self.0
+    }
+    #[inline(always)]
+    fn negate(&self) -> Self {
+        Self::make(negate_wide(self.data(), &Self::MODULUS))
     }
 }
 
 wide_impl! {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84}
-impl Wide for FpWide<85> {
+impl Mag<[u64; 12]> for FpWide<85> {
     type Prev = FpWide<84>;
     type Next = Never;
+    type Mag<const MAGNITUDE: usize> = FpWide<MAGNITUDE>;
+
+    /// A multiple of the prime that is larger than this element could be (p^2).
+    const MODULUS: [u64; 12] = add_wide(&Self::Prev::MODULUS, &MODULUS_INCREMENT);
 
     #[inline(always)]
     fn make(v: [u64; 12]) -> Self {
-        FpWide(v)
+        Self(v)
     }
     #[inline(always)]
     fn data(&self) -> &[u64; 12] {
         &self.0
     }
+    #[inline(always)]
+    fn negate(&self) -> Self {
+        Self::make(negate_wide(self.data(), &Self::MODULUS))
+    }
 }
 
-pub trait Ops<const MAG: usize> {
-    type OpOut: Wide;
-    fn add(lhs: &Self, rhs: &FpWide<MAG>) -> Self::OpOut;
-    fn sub(lhs: &Self, rhs: &FpWide<MAG>) -> Self::OpOut;
-}
-
-impl<const MAG2: usize> Ops<MAG2> for FpWide<0>
+impl<const MAG2: usize> Ops<[u64; 12], MAG2> for FpWide<0>
 where
-    FpWide<MAG2>: Wide,
+    FpWide<MAG2>: Mag<[u64; 12]>,
 {
-    type OpOut = <FpWide<MAG2> as Wide>::Next;
+    type OpOut = <FpWide<MAG2> as Mag<[u64; 12]>>::Next;
     #[inline(always)]
     fn add(lhs: &Self, rhs: &FpWide<MAG2>) -> Self::OpOut {
-        Wide::make(add_wide(&lhs.0, &rhs.0))
+        Mag::make(add_wide(&lhs.0, &rhs.0))
     }
     #[inline(always)]
     fn sub(lhs: &Self, rhs: &FpWide<MAG2>) -> Self::OpOut {
-        Wide::make(add_wide(&lhs.0, &rhs.negate().0))
+        Mag::make(add_wide(&lhs.0, &rhs.negate().0))
     }
 }
 
-impl<const MAG1: usize, const MAG2: usize> Ops<MAG2> for FpWide<MAG1>
+impl<const MAG1: usize, const MAG2: usize> Ops<[u64; 12], MAG2> for FpWide<MAG1>
 where
-    FpWide<MAG1>: Wide + NonZero,
-    <FpWide<MAG1> as Wide>::Prev: Ops<MAG2>,
-    FpWide<MAG2>: Wide,
+    FpWide<MAG1>: Mag<[u64; 12]> + NonZero,
+    <FpWide<MAG1> as Mag<[u64; 12]>>::Prev: Ops<[u64; 12], MAG2>,
+    FpWide<MAG2>: Mag<[u64; 12]>,
 {
-    type OpOut = <<<FpWide<MAG1> as Wide>::Prev as Ops<MAG2>>::OpOut as Wide>::Next;
+    type OpOut = <<<FpWide<MAG1> as Mag<[u64; 12]>>::Prev as Ops<[u64; 12], MAG2>>::OpOut as Mag<
+        [u64; 12],
+    >>::Next;
     #[inline(always)]
-    fn add(lhs: &Self, rhs: &FpWide<MAG2>) -> Self::OpOut {
-        Wide::make(add_wide(&lhs.0, &rhs.0))
+    fn add(lhs: &Self, rhs: &Self::Mag<MAG2>) -> Self::OpOut
+    where
+        Self::Mag<MAG2>: Mag<[u64; 12]>,
+    {
+        Mag::make(add_wide(lhs.data(), rhs.data()))
     }
     #[inline(always)]
-    fn sub(lhs: &Self, rhs: &FpWide<MAG2>) -> Self::OpOut {
-        Wide::make(add_wide(&lhs.0, &(rhs.negate()).0))
+    fn sub(lhs: &Self, rhs: &Self::Mag<MAG2>) -> Self::OpOut
+    where
+        Self::Mag<MAG2>: Mag<[u64; 12]>,
+    {
+        Mag::make(add_wide(&lhs.0, &(rhs.negate()).data()))
     }
 }
 
 impl<'a, 'b, const MAG1: usize, const MAG2: usize> Add<&'b FpWide<MAG2>> for &'a FpWide<MAG1>
 where
-    FpWide<MAG1>: Ops<MAG2>,
+    FpWide<MAG1>: Ops<[u64; 12], MAG2>,
+    <FpWide<MAG1> as Mag<[u64; 12]>>::Mag<MAG2>: Mag<[u64; 12]>,
+    for<'j> &'j FpWide<MAG2>: Into<&'j <FpWide<MAG1> as Mag<[u64; 12]>>::Mag<MAG2>>,
 {
-    type Output = <FpWide<MAG1> as Ops<MAG2>>::OpOut;
+    type Output = <FpWide<MAG1> as Ops<[u64; 12], MAG2>>::OpOut;
 
     #[inline(always)]
     fn add(self, rhs: &'b FpWide<MAG2>) -> Self::Output {
-        Ops::add(self, rhs)
+        Ops::add(self, rhs.into())
     }
 }
 impl<'a, 'b, const MAG1: usize, const MAG2: usize> Sub<&'b FpWide<MAG2>> for &'a FpWide<MAG1>
 where
-    FpWide<MAG1>: Ops<MAG2>,
+    FpWide<MAG1>: Ops<[u64; 12], MAG2>,
+    <FpWide<MAG1> as Mag<[u64; 12]>>::Mag<MAG2>: Mag<[u64; 12]>,
+    for<'j> &'j FpWide<MAG2>: Into<&'j <FpWide<MAG1> as Mag<[u64; 12]>>::Mag<MAG2>>,
 {
-    type Output = <FpWide<MAG1> as Ops<MAG2>>::OpOut;
+    type Output = <FpWide<MAG1> as Ops<[u64; 12], MAG2>>::OpOut;
 
     #[inline(always)]
     fn sub(self, rhs: &'b FpWide<MAG2>) -> Self::Output {
-        Ops::sub(self, rhs)
+        Ops::sub(self, rhs.into())
     }
 }
 
-impl_binops_additive_output! {{const MAG1: usize, const MAG2: usize} {where FpWide<MAG1>: Ops<MAG2>} {FpWide<MAG1>} {FpWide<MAG2>}}
+impl_binops_additive_output! {
+{const MAG1: usize, const MAG2: usize}
+{where FpWide<MAG1>: Ops<[u64; 12], MAG2>, <FpWide<MAG1> as Mag<[u64; 12]>>::Mag<MAG2>: Mag<[u64; 12]>, for<'j> &'j FpWide<MAG2>: Into<&'j <FpWide<MAG1> as Mag<[u64; 12]>>::Mag<MAG2>>}
+{FpWide<MAG1>}
+{FpWide<MAG2>}}
 
 macro_rules! wide_double_impl {
 ($($($ua:literal),+ $(,)?)?) => {$($(
@@ -481,6 +506,7 @@ mod test {
 
     #[test]
     fn test_depth() {
+        const VARTIME: bool = true;
         use rand_core::SeedableRng;
         let mut rng = rand_xorshift::XorShiftRng::from_seed([
             0x57, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
@@ -494,42 +520,42 @@ mod test {
             let v = a * b;
             let v_ur = a.mul_unreduced(&b);
 
-            let v_5 = v.double().double() + v;
+            let v_5 = v.double::<VARTIME>().double::<VARTIME>() + v;
             let v_5_ur = v_ur.double().double() + v_ur;
-            assert_eq!(v_5.0, v_5_ur.montgomery_reduce().0);
+            assert_eq!(v_5.0, v_5_ur.montgomery_reduce::<false>().0);
 
-            let v_10 = v_5.double();
+            let v_10 = v_5.double::<VARTIME>();
             let v_10_ur = v_5_ur + v_5_ur;
-            assert_eq!(v_10.0, v_10_ur.montgomery_reduce().0, "{}", i);
+            assert_eq!(v_10.0, v_10_ur.montgomery_reduce::<VARTIME>().0, "{}", i);
 
-            let v = v.double() + v;
+            let v = v.double::<VARTIME>() + v;
             let v_ur = v_ur.double() + v_ur;
-            assert_eq!(v.0, v_ur.montgomery_reduce().0);
+            assert_eq!(v.0, v_ur.montgomery_reduce::<VARTIME>().0);
 
-            let v = v.double();
+            let v = v.double::<VARTIME>();
             let v_ur = v_ur.double();
-            assert_eq!(v.0, v_ur.montgomery_reduce().0);
+            assert_eq!(v.0, v_ur.montgomery_reduce::<VARTIME>().0);
 
-            let v = v.double();
+            let v = v.double::<VARTIME>();
             let v_ur = v_ur.double();
-            assert_eq!(v.0, v_ur.montgomery_reduce().0);
+            assert_eq!(v.0, v_ur.montgomery_reduce::<VARTIME>().0);
 
-            let v = v.double();
+            let v = v.double::<VARTIME>();
             let v_ur = v_ur.double();
-            assert_eq!(v.0, v_ur.montgomery_reduce().0);
+            assert_eq!(v.0, v_ur.montgomery_reduce::<VARTIME>().0);
 
-            let v = v.double();
+            let v = v.double::<VARTIME>();
             let v_ur = v_ur.double();
-            assert_eq!(v.0, v_ur.montgomery_reduce().0);
+            assert_eq!(v.0, v_ur.montgomery_reduce::<VARTIME>().0);
 
-            let v = v_10.double().double();
+            let v = v_10.double::<VARTIME>().double::<VARTIME>();
             let v_ur = v_10_ur.double().double();
-            assert_eq!(v.0, v_ur.montgomery_reduce().0);
+            assert_eq!(v.0, v_ur.montgomery_reduce::<VARTIME>().0);
 
-            let v = v.double() + v_5;
+            let v = v.double::<VARTIME>() + v_5;
             let v_ur: FpWide<84> = v_ur.double() + v_5_ur;
-            assert_eq!(v, v_ur.montgomery_reduce(), "{}", i);
-            assert_eq!(v.0, v_ur.montgomery_reduce().0, "{}", i);
+            assert_eq!(v, v_ur.montgomery_reduce::<VARTIME>(), "{}", i);
+            assert_eq!(v.0, v_ur.montgomery_reduce::<VARTIME>().0, "{}", i);
         }
     }
 
@@ -560,7 +586,7 @@ mod test {
 
             assert_eq!(
                 a * b + c * d,
-                (a.mul_unreduced(&b) + c.mul_unreduced(&d)).montgomery_reduce()
+                (a.mul_unreduced(&b) + c.mul_unreduced(&d)).montgomery_reduce::<false>()
             );
         }
 
@@ -596,8 +622,8 @@ mod test {
             let mut items = items.into_iter().map(|(v, _)| v);
             let total = items.next().unwrap();
             let total: Fp = items.fold(total, |total, v| total + v);
-            assert_eq!(total.0, total_ur.montgomery_reduce().0);
-            assert_eq!(total, total_ur.montgomery_reduce());
+            assert_eq!(total.0, total_ur.montgomery_reduce::<false>().0);
+            assert_eq!(total, total_ur.montgomery_reduce::<false>());
         }
     }
 }

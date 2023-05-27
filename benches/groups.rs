@@ -6,13 +6,15 @@ use bls12_381::*;
 
 use criterion::{black_box, Criterion};
 
+const VARTIME: bool = true;
+
 fn criterion_benchmark(c: &mut Criterion) {
     // Pairings
     {
         let g = G1Affine::generator();
         let h = G2Affine::generator();
         c.bench_function("full pairing", move |b| {
-            b.iter(|| pairing(black_box(&g), black_box(&h)))
+            b.iter(|| pairing::<VARTIME>(black_box(&g), black_box(&h)))
         });
         c.bench_function("G2 preparation for pairing", move |b| {
             b.iter(|| G2Prepared::from(h))
@@ -24,7 +26,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         let prep = G2Prepared::from(h);
         let r = multi_miller_loop(&[(&g, &prep)]);
         c.bench_function("final exponentiation for pairing", move |b| {
-            b.iter(|| r.final_exponentiation())
+            b.iter(|| r.final_exponentiation::<VARTIME>())
         });
     }
     // G1Affine
@@ -41,7 +43,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             b.iter(|| black_box(a) == black_box(a))
         });
         c.bench_function(&format!("{} scalar multiplication", name), move |b| {
-            b.iter(|| black_box(a) * black_box(s))
+            b.iter(|| black_box(a).mul::<VARTIME>(black_box(&s)))
         });
         c.bench_function(&format!("{} subgroup check", name), move |b| {
             b.iter(|| black_box(a).is_torsion_free())
@@ -77,16 +79,16 @@ fn criterion_benchmark(c: &mut Criterion) {
             b.iter(|| G1Affine::from(black_box(a)))
         });
         c.bench_function(&format!("{} doubling", name), move |b| {
-            b.iter(|| black_box(a).double())
+            b.iter(|| black_box(a).double::<VARTIME>())
         });
         c.bench_function(&format!("{} addition", name), move |b| {
-            b.iter(|| black_box(a).add(&a))
+            b.iter(|| black_box(a).add::<VARTIME>(&a))
         });
         c.bench_function(&format!("{} mixed addition", name), move |b| {
-            b.iter(|| black_box(a).add_mixed(&a_affine))
+            b.iter(|| black_box(a).add_mixed::<VARTIME>(&a_affine))
         });
         c.bench_function(&format!("{} scalar multiplication", name), move |b| {
-            b.iter(|| black_box(a) * black_box(s))
+            b.iter(|| black_box(a).mul::<VARTIME>(black_box(&s)))
         });
         c.bench_function(&format!("{} batch to affine n={}", name, N), move |b| {
             b.iter(|| {
@@ -110,7 +112,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             b.iter(|| black_box(a) == black_box(a))
         });
         c.bench_function(&format!("{} scalar multiplication", name), move |b| {
-            b.iter(|| black_box(a) * black_box(s))
+            b.iter(|| black_box(a).mul::<VARTIME>(black_box(&s)))
         });
         c.bench_function(&format!("{} subgroup check", name), move |b| {
             b.iter(|| black_box(a).is_torsion_free())
@@ -146,7 +148,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             b.iter(|| G2Affine::from(black_box(a)))
         });
         c.bench_function(&format!("{} doubling", name), move |b| {
-            b.iter(|| black_box(a).double())
+            b.iter(|| black_box(a).double::<VARTIME>())
         });
         c.bench_function(&format!("{} addition", name), move |b| {
             b.iter(|| black_box(a).add(&a))
@@ -155,7 +157,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             b.iter(|| black_box(a).add_mixed(&a_affine))
         });
         c.bench_function(&format!("{} scalar multiplication", name), move |b| {
-            b.iter(|| black_box(a) * black_box(s))
+            b.iter(|| black_box(a).mul::<VARTIME>(black_box(&s)))
         });
         c.bench_function(&format!("{} batch to affine n={}", name, N), move |b| {
             b.iter(|| {

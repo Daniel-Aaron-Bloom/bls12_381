@@ -65,7 +65,7 @@ impl<'a> Neg for &'a Fp2 {
 
     #[inline]
     fn neg(self) -> Fp2 {
-        self.neg()
+        self.neg::<false>()
     }
 }
 
@@ -83,7 +83,7 @@ impl<'a, 'b> Sub<&'b Fp2> for &'a Fp2 {
 
     #[inline]
     fn sub(self, rhs: &'b Fp2) -> Fp2 {
-        self.sub(rhs)
+        self.sub::<false>(rhs)
     }
 }
 
@@ -92,7 +92,7 @@ impl<'a, 'b> Add<&'b Fp2> for &'a Fp2 {
 
     #[inline]
     fn add(self, rhs: &'b Fp2) -> Fp2 {
-        self.add(rhs)
+        self.add::<false>(rhs)
     }
 }
 
@@ -101,7 +101,7 @@ impl<'a, 'b> Mul<&'b Fp2> for &'a Fp2 {
 
     #[inline]
     fn mul(self, rhs: &'b Fp2) -> Fp2 {
-        self.mul(rhs)
+        self.mul::<false>(rhs)
     }
 }
 
@@ -129,6 +129,10 @@ impl Fp2 {
         self.c0.is_zero() & self.c1.is_zero()
     }
 
+    pub fn is_zero_vartime(&self) -> bool {
+        self.c0.is_zero_vartime() & self.c1.is_zero_vartime()
+    }
+
     pub(crate) fn random(mut rng: impl RngCore) -> Fp2 {
         Fp2 {
             c0: Fp::random(&mut rng),
@@ -138,30 +142,30 @@ impl Fp2 {
 
     /// Raises this element to p.
     #[inline(always)]
-    pub fn frobenius_map(&self) -> Self {
+    pub fn frobenius_map<const VARTIME: bool>(&self) -> Self {
         // This is always just a conjugation. If you're curious why, here's
         // an article about it: https://alicebob.cryptoland.net/the-frobenius-endomorphism-with-finite-fields/
-        self.conjugate()
+        self.conjugate::<VARTIME>()
     }
 
     #[inline(always)]
-    pub fn conjugate(&self) -> Self {
+    pub fn conjugate<const VARTIME: bool>(&self) -> Self {
         Fp2 {
             c0: self.c0,
-            c1: -self.c1,
+            c1: (&self.c1).neg::<VARTIME>(),
         }
     }
 
     #[inline(always)]
-    pub fn mul_by_nonresidue(&self) -> Fp2 {
+    pub fn mul_by_nonresidue<const VARTIME: bool>(&self) -> Fp2 {
         // Multiply a + bu by u + 1, getting
         // au + a + bu^2 + bu
         // and because u^2 = -1, we get
         // (a - b) + (a + b)u
 
         Fp2 {
-            c0: self.c0 - self.c1,
-            c1: self.c0 + self.c1,
+            c0: (&self.c0).sub::<VARTIME>(&self.c1),
+            c1: (&self.c0).add::<VARTIME>(&self.c1),
         }
     }
 
@@ -179,7 +183,7 @@ impl Fp2 {
             | (self.c1.is_zero() & self.c0.lexicographically_largest())
     }
 
-    pub const fn square(&self) -> Fp2 {
+    pub const fn square<const VARTIME: bool>(&self) -> Fp2 {
         // Complex squaring:
         //
         // v0  = c0 * c1
@@ -192,17 +196,17 @@ impl Fp2 {
         // c0' = (c0 + c1) * (c0 - c1)
         // c1' = 2 * c0 * c1
 
-        let a = (&self.c0).add(&self.c1);
-        let b = (&self.c0).sub(&self.c1);
-        let c = (&self.c0).add(&self.c0);
+        let a = (&self.c0).add::<VARTIME>(&self.c1);
+        let b = (&self.c0).sub::<VARTIME>(&self.c1);
+        let c = (&self.c0).add::<VARTIME>(&self.c0);
 
         Fp2 {
-            c0: (&a).mul(&b),
-            c1: (&c).mul(&self.c1),
+            c0: (&a).mul::<VARTIME>(&b),
+            c1: (&c).mul::<VARTIME>(&self.c1),
         }
     }
 
-    pub fn mul(&self, rhs: &Fp2) -> Fp2 {
+    pub fn mul<const VARTIME: bool>(&self, rhs: &Fp2) -> Fp2 {
         // F_{p^2} x F_{p^2} multiplication implemented with operand scanning (schoolbook)
         // computes the result as:
         //
@@ -216,29 +220,29 @@ impl Fp2 {
         // Each of these is a "sum of products", which we can compute efficiently.
 
         Fp2 {
-            c0: Fp::sum_of_products([self.c0, -self.c1], [rhs.c0, rhs.c1]),
-            c1: Fp::sum_of_products([self.c0, self.c1], [rhs.c1, rhs.c0]),
+            c0: Fp::sum_of_products::<2, VARTIME>([self.c0, -self.c1], [rhs.c0, rhs.c1]),
+            c1: Fp::sum_of_products::<2, VARTIME>([self.c0, self.c1], [rhs.c1, rhs.c0]),
         }
     }
 
-    pub const fn add(&self, rhs: &Fp2) -> Fp2 {
+    pub const fn add<const VARTIME: bool>(&self, rhs: &Fp2) -> Fp2 {
         Fp2 {
-            c0: (&self.c0).add(&rhs.c0),
-            c1: (&self.c1).add(&rhs.c1),
+            c0: (&self.c0).add::<VARTIME>(&rhs.c0),
+            c1: (&self.c1).add::<VARTIME>(&rhs.c1),
         }
     }
 
-    pub const fn sub(&self, rhs: &Fp2) -> Fp2 {
+    pub const fn sub<const VARTIME: bool>(&self, rhs: &Fp2) -> Fp2 {
         Fp2 {
-            c0: (&self.c0).sub(&rhs.c0),
-            c1: (&self.c1).sub(&rhs.c1),
+            c0: (&self.c0).sub::<VARTIME>(&rhs.c0),
+            c1: (&self.c1).sub::<VARTIME>(&rhs.c1),
         }
     }
 
-    pub const fn neg(&self) -> Fp2 {
+    pub const fn neg<const VARTIME: bool>(&self) -> Fp2 {
         Fp2 {
-            c0: (&self.c0).neg(),
-            c1: (&self.c1).neg(),
+            c0: (&self.c0).neg::<VARTIME>(),
+            c1: (&self.c1).neg::<VARTIME>(),
         }
     }
 
@@ -258,7 +262,7 @@ impl Fp2 {
             ]);
 
             // alpha = a1^2 * self = self^((p - 3) / 2 + 1) = self^((p - 1) / 2)
-            let alpha = a1.square() * self;
+            let alpha = a1.square::<false>() * self;
 
             // x0 = self^((p + 1) / 4)
             let x0 = a1 * self;
@@ -272,7 +276,7 @@ impl Fp2 {
                     c0: -x0.c1,
                     c1: x0.c0,
                 },
-                alpha.ct_eq(&(&Fp2::one()).neg()),
+                alpha.ct_eq(&(&Fp2::one()).neg::<false>()),
             )
             // Otherwise, the correct solution is (1 + alpha)^((q - 1) // 2) * x0
             .or_else(|| {
@@ -290,7 +294,7 @@ impl Fp2 {
             })
             // Only return the result if it's really the square root (and so
             // self is actually quadratic nonresidue)
-            .and_then(|sqrt| CtOption::new(sqrt, sqrt.square().ct_eq(self)))
+            .and_then(|sqrt| CtOption::new(sqrt, sqrt.square::<false>().ct_eq(self)))
         })
     }
 
@@ -313,7 +317,7 @@ impl Fp2 {
         // only a single inversion in Fp.
 
         (self.c0.square_unreduced() + self.c1.square_unreduced())
-            .montgomery_reduce()
+            .montgomery_reduce::<false>()
             .invert()
             .map(|t| Fp2 {
                 c0: self.c0 * t,
@@ -328,7 +332,7 @@ impl Fp2 {
         let mut res = Self::one();
         for e in by.iter().rev() {
             for i in (0..64).rev() {
-                res = res.square();
+                res = res.square::<true>();
 
                 if ((*e >> i) & 1) == 1 {
                     res *= self;
@@ -461,7 +465,7 @@ fn test_squaring() {
         ]),
     };
 
-    assert_eq!(a.square(), b);
+    assert_eq!(a.square::<false>(), b);
 }
 
 #[test]
@@ -708,7 +712,7 @@ fn test_sqrt() {
         ]),
     };
 
-    assert_eq!(a.sqrt().unwrap().square(), a);
+    assert_eq!(a.sqrt().unwrap().square::<false>(), a);
 
     // b = 5, which is a generator of the p - 1 order
     // multiplicative subgroup
@@ -724,7 +728,7 @@ fn test_sqrt() {
         c1: Fp::zero(),
     };
 
-    assert_eq!(b.sqrt().unwrap().square(), b);
+    assert_eq!(b.sqrt().unwrap().square::<false>(), b);
 
     // c = 25, which is a generator of the (p - 1) / 2 order
     // multiplicative subgroup
@@ -740,7 +744,7 @@ fn test_sqrt() {
         c1: Fp::zero(),
     };
 
-    assert_eq!(c.sqrt().unwrap().square(), c);
+    assert_eq!(c.sqrt().unwrap().square::<false>(), c);
 
     // 2155129644831861015726826462986972654175647013268275306775721078997042729172900466542651176384766902407257452753362*u + 2796889544896299244102912275102369318775038861758288697415827248356648685135290329705805931514906495247464901062529
     // is nonsquare.

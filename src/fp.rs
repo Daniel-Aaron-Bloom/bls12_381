@@ -6,18 +6,244 @@ use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 use rand_core::RngCore;
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 
-use crate::util::{carrying_add, adc, mac, borrowing_sub, slc};
+use crate::util::{adc, borrowing_sub, carrying_add, mac, slc};
 
 pub mod wide;
 use wide::FpWide;
+
+// Hack to get the ! type on stable
+#[doc(hidden)]
+pub trait HasOutput {
+    type Output;
+}
+impl<O> HasOutput for fn() -> O {
+    type Output = O;
+}
+type Never = <fn() -> ! as HasOutput>::Output;
+
+#[doc(hidden)]
+pub trait NonZero {}
+
+#[doc(hidden)]
+pub trait Mag<Data>: Sized {
+    type Prev: Mag<Data>;
+    type Next: Mag<Data>;
+
+    type Mag<const MAGNITUDE: usize>;
+
+    /// A multiple of the prime that is larger than this element could be
+    const MODULUS: Data;
+
+    fn make(v: Data) -> Self;
+    fn data(&self) -> &Data;
+    /// Negates an element by subtracting it from the `Self::MODULUS`
+    fn negate(&self) -> Self;
+}
+
+impl<Data> Mag<Data> for Never {
+    type Prev = Never;
+    type Next = Never;
+    type Mag<const MAGNITUDE: usize> = Never;
+
+    const MODULUS: Data = unimplemented!();
+
+    #[inline(always)]
+    fn make(_: Data) -> Self {
+        unimplemented!()
+    }
+    #[inline(always)]
+    fn data(&self) -> &Data {
+        unreachable!()
+    }
+    #[inline(always)]
+    fn negate(&self) -> Self {
+        unreachable!()
+    }
+}
+
+pub trait Ops<Data, const MAG: usize>: Mag<Data> {
+    type OpOut: Mag<Data>;
+    fn add(lhs: &Self, rhs: &Self::Mag<MAG>) -> Self::OpOut
+    where
+        Self::Mag<MAG>: Mag<Data>;
+    fn sub(lhs: &Self, rhs: &Self::Mag<MAG>) -> Self::OpOut
+    where
+        Self::Mag<MAG>: Mag<Data>;
+}
+
+#[inline]
+const fn negate(v: &[u64; 6], modulus: &[u64; 6]) -> [u64; 6] {
+    let (d0, borrow) = borrowing_sub(modulus[0], v[0], false);
+    let (d1, borrow) = borrowing_sub(modulus[1], v[1], borrow);
+    let (d2, borrow) = borrowing_sub(modulus[2], v[2], borrow);
+    let (d3, borrow) = borrowing_sub(modulus[3], v[3], borrow);
+    let (d4, borrow) = borrowing_sub(modulus[4], v[4], borrow);
+    let (d5, _) = borrowing_sub(modulus[5], v[5], borrow);
+    [d0, d1, d2, d3, d4, d5]
+}
+
+#[inline]
+const fn add(lhs: &[u64; 6], rhs: &[u64; 6]) -> [u64; 6] {
+    let (d0, carry) = adc(lhs[0], rhs[0], 0);
+    let (d1, carry) = adc(lhs[1], rhs[1], carry);
+    let (d2, carry) = adc(lhs[2], rhs[2], carry);
+    let (d3, carry) = adc(lhs[3], rhs[3], carry);
+    let (d4, carry) = adc(lhs[4], rhs[4], carry);
+    let (d5, _) = adc(lhs[5], rhs[5], carry);
+
+    [d0, d1, d2, d3, d4, d5]
+}
 
 // The internal representation of this type is six 64-bit unsigned
 // integers in little-endian order. `Fp` values are always in
 // Montgomery form; i.e., Scalar(a) = aR mod p, with R = 2^384.
 #[derive(Copy, Clone)]
-pub struct Fp(pub(crate) [u64; 6]);
+pub struct Fp<const MAGNITUDE: usize = 0>(pub(crate) [u64; 6]);
 
-impl fmt::Debug for Fp {
+impl Mag<[u64; 6]> for Fp<0> {
+    type Prev = Never;
+    type Next = Fp<1>;
+    type Mag<const MAGNITUDE: usize> = Fp<MAGNITUDE>;
+
+    /// A multiple of the prime that is larger than this element could be (p).
+    const MODULUS: [u64; 6] = MODULUS;
+
+    #[inline(always)]
+    fn make(v: [u64; 6]) -> Self {
+        Self(v)
+    }
+    #[inline(always)]
+    fn data(&self) -> &[u64; 6] {
+        &self.0
+    }
+    #[inline(always)]
+    fn negate(&self) -> Self {
+        Self::make(negate(self.data(), &Self::MODULUS))
+    }
+}
+
+macro_rules! mag_impl {
+    ($($($ua:literal),+ $(,)?)?) => {$($(
+impl Mag<[u64; 6]> for Fp<$ua> {
+    type Prev = Fp<{$ua - 1}>;
+    type Next = Fp<{$ua + 1}>;
+    type Mag<const MAGNITUDE: usize> = Fp<MAGNITUDE>;
+
+    /// A multiple of the prime that is larger than this element could be (p).
+    const MODULUS: [u64; 6] = add(&Self::Prev::MODULUS, &MODULUS);
+
+    #[inline(always)]
+    fn make(v: [u64; 6]) -> Self {
+        Self(v)
+    }
+    #[inline(always)]
+    fn data(&self) -> &[u64; 6] {
+        &self.0
+    }
+    #[inline(always)]
+    fn negate(&self) -> Self {
+        Self::make(negate(self.data(), &Self::MODULUS))
+    }
+}
+
+impl NonZero for Fp<$ua> {}
+    )+)?};
+}
+mag_impl! {1, 2, 3, 4, 5, 6, 7}
+impl Mag<[u64; 6]> for Fp<8> {
+    type Prev = Fp<7>;
+    type Next = Never;
+    type Mag<const MAGNITUDE: usize> = Fp<MAGNITUDE>;
+
+    /// A multiple of the prime that is larger than this element could be (p).
+    const MODULUS: [u64; 6] = add(&Self::Prev::MODULUS, &MODULUS);
+
+    #[inline(always)]
+    fn make(v: [u64; 6]) -> Self {
+        Self(v)
+    }
+    #[inline(always)]
+    fn data(&self) -> &[u64; 6] {
+        &self.0
+    }
+    #[inline(always)]
+    fn negate(&self) -> Self {
+        Self::make(negate(self.data(), &Self::MODULUS))
+    }
+}
+
+impl<const MAG2: usize> Ops<[u64; 6], MAG2> for Fp<0>
+where
+    Fp<MAG2>: Mag<[u64; 6]>,
+{
+    type OpOut = <Fp<MAG2> as Mag<[u64; 6]>>::Next;
+    #[inline(always)]
+    fn add(lhs: &Self, rhs: &Fp<MAG2>) -> Self::OpOut {
+        Mag::make(add(&lhs.0, &rhs.0))
+    }
+    #[inline(always)]
+    fn sub(lhs: &Self, rhs: &Fp<MAG2>) -> Self::OpOut {
+        Mag::make(add(&lhs.0, &rhs.negate().0))
+    }
+}
+
+impl<const MAG1: usize, const MAG2: usize> Ops<[u64; 6], MAG2> for Fp<MAG1>
+where
+    Fp<MAG1>: Mag<[u64; 6]> + NonZero,
+    <Fp<MAG1> as Mag<[u64; 6]>>::Prev: Ops<[u64; 6], MAG2>,
+    Fp<MAG2>: Mag<[u64; 6]>,
+{
+    type OpOut =
+        <<<Fp<MAG1> as Mag<[u64; 6]>>::Prev as Ops<[u64; 6], MAG2>>::OpOut as Mag<[u64; 6]>>::Next;
+    #[inline(always)]
+    fn add(lhs: &Self, rhs: &Self::Mag<MAG2>) -> Self::OpOut
+    where
+        Self::Mag<MAG2>: Mag<[u64; 6]>,
+    {
+        Mag::make(add(lhs.data(), rhs.data()))
+    }
+    #[inline(always)]
+    fn sub(lhs: &Self, rhs: &Self::Mag<MAG2>) -> Self::OpOut
+    where
+        Self::Mag<MAG2>: Mag<[u64; 6]>,
+    {
+        Mag::make(add(&lhs.0, &(rhs.negate()).data()))
+    }
+}
+
+impl<'a, 'b, const MAG1: usize, const MAG2: usize> Add<&'b Fp<MAG2>> for &'a Fp<MAG1>
+where
+    Fp<MAG1>: NonZero + Ops<[u64; 6], MAG2>,
+    <Fp<MAG1> as Mag<[u64; 6]>>::Mag<MAG2>: Mag<[u64; 6]>,
+    for<'j> &'j Fp<MAG2>: Into<&'j <Fp<MAG1> as Mag<[u64; 6]>>::Mag<MAG2>>,
+{
+    type Output = <Fp<MAG1> as Ops<[u64; 6], MAG2>>::OpOut;
+
+    #[inline(always)]
+    fn add(self, rhs: &'b Fp<MAG2>) -> Self::Output {
+        Ops::add(self, rhs.into())
+    }
+}
+impl<'a, 'b, const MAG1: usize, const MAG2: usize> Sub<&'b Fp<MAG2>> for &'a Fp<MAG1>
+where
+    Fp<MAG1>: NonZero + Ops<[u64; 6], MAG2>,
+    <Fp<MAG1> as Mag<[u64; 6]>>::Mag<MAG2>: Mag<[u64; 6]>,
+    for<'j> &'j Fp<MAG2>: Into<&'j <Fp<MAG1> as Mag<[u64; 6]>>::Mag<MAG2>>,
+{
+    type Output = <Fp<MAG1> as Ops<[u64; 6], MAG2>>::OpOut;
+
+    #[inline(always)]
+    fn sub(self, rhs: &'b Fp<MAG2>) -> Self::Output {
+        Ops::sub(self, rhs.into())
+    }
+}
+impl_binops_additive_output! {
+{const MAG1: usize, const MAG2: usize}
+{where Fp<MAG1>: NonZero+Ops<[u64; 6], MAG2>, <Fp<MAG1> as Mag<[u64; 6]>>::Mag<MAG2>: Mag<[u64; 6]>, for<'j> &'j Fp<MAG2>: Into<&'j <Fp<MAG1> as Mag<[u64; 6]>>::Mag<MAG2>>}
+{Fp<MAG1>}
+{Fp<MAG2>}}
+
+impl<const MAGNITUDE: usize> fmt::Debug for Fp<MAGNITUDE> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let tmp = self.to_bytes();
         write!(f, "0x")?;
@@ -37,7 +263,7 @@ impl Default for Fp {
 #[cfg(feature = "zeroize")]
 impl zeroize::DefaultIsZeroes for Fp {}
 
-impl ConstantTimeEq for Fp {
+impl<const MAGNITUDE: usize> ConstantTimeEq for Fp<MAGNITUDE> {
     fn ct_eq(&self, other: &Self) -> Choice {
         self.0[0].ct_eq(&other.0[0])
             & self.0[1].ct_eq(&other.0[1])
@@ -107,7 +333,7 @@ const fn subtract_p<const VARTIME: bool>(v: &[u64; 6], modulus: &[u64; 6]) -> [u
                 (v[4] & borrow) | (r4 & !borrow),
                 (v[5] & borrow) | (r5 & !borrow),
             ]
-        },
+        }
     }
 }
 
@@ -163,7 +389,7 @@ impl<'a> Neg for &'a Fp {
 
     #[inline]
     fn neg(self) -> Fp {
-        self.neg()
+        self.neg::<false>()
     }
 }
 
@@ -181,7 +407,7 @@ impl<'a, 'b> Sub<&'b Fp> for &'a Fp {
 
     #[inline]
     fn sub(self, rhs: &'b Fp) -> Fp {
-        self.sub(rhs)
+        self.sub::<false>(rhs)
     }
 }
 
@@ -190,7 +416,7 @@ impl<'a, 'b> Add<&'b Fp> for &'a Fp {
 
     #[inline]
     fn add(self, rhs: &'b Fp) -> Fp {
-        self.add(rhs)
+        self.add::<false>(rhs)
     }
 }
 
@@ -199,39 +425,118 @@ impl<'a, 'b> Mul<&'b Fp> for &'a Fp {
 
     #[inline]
     fn mul(self, rhs: &'b Fp) -> Fp {
-        self.mul(rhs)
+        self.mul::<false>(rhs)
     }
 }
 
 impl_binops_additive!(Fp, Fp);
 impl_binops_multiplicative!(Fp, Fp);
 
-impl Fp {
+impl<const MAGNITUDE: usize> Fp<MAGNITUDE> {
     /// Returns zero, the additive identity.
     #[inline]
-    pub const fn zero() -> Fp {
-        Fp([0, 0, 0, 0, 0, 0])
+    pub const fn zero() -> Self {
+        Self([0, 0, 0, 0, 0, 0])
     }
-
     /// Returns one, the multiplicative identity.
     #[inline]
-    pub const fn one() -> Fp {
-        R
+    pub const fn one() -> Self {
+        Self(R.0)
     }
 
-    pub const fn eq_vartime(&self, rhs: &Fp) -> bool {
-        self.0[0] == rhs.0[0] &&
-        self.0[1] == rhs.0[1] &&
-        self.0[2] == rhs.0[2] &&
-        self.0[3] == rhs.0[3] &&
-        self.0[4] == rhs.0[4] &&
-        self.0[5] == rhs.0[5]
+    pub const fn eq_vartime(&self, rhs: &Self) -> bool {
+        self.0[0] == rhs.0[0]
+            && self.0[1] == rhs.0[1]
+            && self.0[2] == rhs.0[2]
+            && self.0[3] == rhs.0[3]
+            && self.0[4] == rhs.0[4]
+            && self.0[5] == rhs.0[5]
     }
 
+    #[inline]
     pub fn is_zero(&self) -> Choice {
         self.ct_eq(&Fp::zero())
     }
 
+    #[inline]
+    pub fn is_zero_vartime(&self) -> bool {
+        self.eq_vartime(&Fp::zero())
+    }
+
+    /// Constructs an element of `Fp` without checking that it is
+    /// canonical.
+    #[inline]
+    pub const fn from_raw_unchecked(v: [u64; 6]) -> Self {
+        Self(v)
+    }
+
+    /// Constructs an element of `Fp` ensuring that it is canonical.
+    pub const fn from_raw(v: [u64; 6]) -> Self {
+        // Attempt to subtract all possible multiples of the modulus, to ensure
+        // the value is smaller than the modulus.
+        let v = subtract_p::<false>(&v, &P8);
+        let v = subtract_p::<false>(&v, &P4);
+        let v = subtract_p::<false>(&v, &P2);
+        let v = subtract_p::<false>(&v, &MODULUS);
+        Self(v)
+    }
+
+    #[inline(always)]
+    pub(crate) fn montgomery_reduce(&self) -> [u64; 6] {
+        let mut new = [0; 12];
+        new[0] = self.0[0];
+        new[1] = self.0[1];
+        new[2] = self.0[2];
+        new[3] = self.0[3];
+        new[4] = self.0[4];
+        new[5] = self.0[5];
+        let mut v = wide::montgomery_reduce_wide(&new);
+        if MAGNITUDE > 0 {
+            v = subtract_p::<false>(&v, &MODULUS)
+        }
+        v
+    }
+
+    /// Converts an element of `Fp` into a byte representation in
+    /// big-endian byte order.
+    pub fn to_bytes(self) -> [u8; 48] {
+        // Turn into canonical form by computing
+        // (a.R) / R = a
+        let tmp = self.montgomery_reduce();
+
+        let mut res = [0; 48];
+        res[0..8].copy_from_slice(&tmp[5].to_be_bytes());
+        res[8..16].copy_from_slice(&tmp[4].to_be_bytes());
+        res[16..24].copy_from_slice(&tmp[3].to_be_bytes());
+        res[24..32].copy_from_slice(&tmp[2].to_be_bytes());
+        res[32..40].copy_from_slice(&tmp[1].to_be_bytes());
+        res[40..48].copy_from_slice(&tmp[0].to_be_bytes());
+
+        res
+    }
+
+    pub fn reduce<const VARTIME: bool>(self) -> Fp
+    where
+        Self: NonZero,
+    {
+        let mut v = self.0;
+        if MAGNITUDE >= 8 {
+            v = subtract_p::<VARTIME>(&v, &P8)
+        }
+        if MAGNITUDE >= 4 {
+            v = subtract_p::<VARTIME>(&v, &P4)
+        }
+        if MAGNITUDE >= 2 {
+            v = subtract_p::<VARTIME>(&v, &P2)
+        }
+        if MAGNITUDE >= 1 {
+            v = subtract_p::<VARTIME>(&v, &MODULUS)
+        }
+        Fp(v)
+    }
+}
+
+impl Fp {
     /// Attempts to convert a big-endian byte representation of
     /// a scalar into an `Fp`, failing if the input is not canonical.
     pub fn from_bytes(bytes: &[u8; 48]) -> CtOption<Fp> {
@@ -262,24 +567,6 @@ impl Fp {
         tmp *= &R2;
 
         CtOption::new(tmp, Choice::from(is_some))
-    }
-
-    /// Converts an element of `Fp` into a byte representation in
-    /// big-endian byte order.
-    pub fn to_bytes(self) -> [u8; 48] {
-        // Turn into canonical form by computing
-        // (a.R) / R = a
-        let tmp = self.montgomery_reduce();
-
-        let mut res = [0; 48];
-        res[0..8].copy_from_slice(&tmp[5].to_be_bytes());
-        res[8..16].copy_from_slice(&tmp[4].to_be_bytes());
-        res[16..24].copy_from_slice(&tmp[3].to_be_bytes());
-        res[24..32].copy_from_slice(&tmp[2].to_be_bytes());
-        res[32..40].copy_from_slice(&tmp[1].to_be_bytes());
-        res[40..48].copy_from_slice(&tmp[0].to_be_bytes());
-
-        res
     }
 
     pub(crate) fn random(mut rng: impl RngCore) -> Fp {
@@ -351,23 +638,6 @@ impl Fp {
         !Choice::from(borrow as u8)
     }
 
-    /// Constructs an element of `Fp` without checking that it is
-    /// canonical.
-    pub const fn from_raw_unchecked(v: [u64; 6]) -> Fp {
-        Fp(v)
-    }
-
-    /// Constructs an element of `Fp` ensuring that it is canonical.
-    pub const fn from_raw(v: [u64; 6]) -> Fp {
-        // Attempt to subtract all possible multiples of the modulus, to ensure
-        // the value is smaller than the modulus.
-        let v = subtract_p::<false>(&v, &P8);
-        let v = subtract_p::<false>(&v, &P4);
-        let v = subtract_p::<false>(&v, &P2);
-        let v = subtract_p::<false>(&v, &MODULUS);
-        Fp(v)
-    }
-
     /// Although this is labeled "vartime", it is only
     /// variable time with respect to the exponent. It
     /// is also not exposed in the public API.
@@ -375,7 +645,7 @@ impl Fp {
         let mut res = Self::one();
         for e in by.iter().rev() {
             for i in (0..64).rev() {
-                res = res.square();
+                res = res.square::<true>();
 
                 if ((*e >> i) & 1) == 1 {
                     res *= self;
@@ -401,7 +671,7 @@ impl Fp {
             0x0680_447a_8e5f_f9a6,
         ]);
 
-        CtOption::new(sqrt, sqrt.square().ct_eq(self))
+        CtOption::new(sqrt, sqrt.square::<false>().ct_eq(self))
     }
 
     #[inline]
@@ -435,17 +705,10 @@ impl Fp {
     }
 
     #[inline]
-    pub const fn add(&self, rhs: &Fp) -> Fp {
+    pub const fn add<const VARTIME: bool>(&self, rhs: &Fp) -> Fp {
         // Attempt to subtract the modulus, to ensure the value
         // is smaller than the modulus.
-        Fp(subtract_p::<false>(&self.add_helper(rhs), &MODULUS))
-    }
-    
-    #[inline]
-    pub const fn add_vartime(&self, rhs: &Fp) -> Fp {
-        // Attempt to subtract the modulus, to ensure the value
-        // is smaller than the modulus.
-        Fp(subtract_p::<true>(&self.add_helper(rhs), &MODULUS))
+        Fp(subtract_p::<VARTIME>(&self.add_helper(rhs), &MODULUS))
     }
 
     #[inline]
@@ -456,46 +719,47 @@ impl Fp {
         let (d3, borrow) = borrowing_sub(MODULUS[3], self.0[3], borrow);
         let (d4, borrow) = borrowing_sub(MODULUS[4], self.0[4], borrow);
         let (d5, _) = borrowing_sub(MODULUS[5], self.0[5], borrow);
-        [ d0, d1, d2, d3, d4, d5 ]
+        [d0, d1, d2, d3, d4, d5]
     }
+
     #[inline]
-    pub const fn neg_vartime(&self) -> Fp {
-        if self.eq_vartime(&Fp::zero()) {
-            *self
+    pub const fn neg<const VARTIME: bool>(&self) -> Fp {
+        if VARTIME {
+            if self.eq_vartime(&Fp::zero()) {
+                *self
+            } else {
+                Fp(self.neg_helper())
+            }
         } else {
-            Fp(self.neg_helper())
+            // Let's use a mask if `self` was zero, which would mean
+            // the result of the subtraction is p.
+            let mask = (((self.0[0] | self.0[1] | self.0[2] | self.0[3] | self.0[4] | self.0[5]) == 0)
+                as u64)
+                .wrapping_sub(1);
+    
+            let v = self.neg_helper();
+            Fp([
+                v[0] & mask,
+                v[1] & mask,
+                v[2] & mask,
+                v[3] & mask,
+                v[4] & mask,
+                v[5] & mask,
+            ])
+
         }
     }
 
     #[inline]
-    pub const fn neg(&self) -> Fp {
-        // Let's use a mask if `self` was zero, which would mean
-        // the result of the subtraction is p.
-        let mask = (((self.0[0] | self.0[1] | self.0[2] | self.0[3] | self.0[4] | self.0[5]) == 0)
-            as u64)
-            .wrapping_sub(1);
-
-        let v = self.neg_helper();
-        Fp([
-            v[0] & mask,
-            v[1] & mask,
-            v[2] & mask,
-            v[3] & mask,
-            v[4] & mask,
-            v[5] & mask,
-        ])
-    }
-
-    #[inline]
-    pub const fn double(&self) -> Fp {
+    pub const fn double<const VARTIME: bool>(&self) -> Fp {
         // Attempt to subtract the modulus, to ensure the value
         // is smaller than the modulus.
-        Fp(subtract_p::<false>(&double(&self.0), &MODULUS))
+        Fp(subtract_p::<VARTIME>(&double(&self.0), &MODULUS))
     }
 
     #[inline]
-    pub const fn sub(&self, rhs: &Fp) -> Fp {
-        (&rhs.neg()).add(self)
+    pub const fn sub<const VARTIME: bool>(&self, rhs: &Fp) -> Fp {
+        (&rhs.neg::<VARTIME>()).add::<VARTIME>(self)
     }
 
     /// Returns `c = a.zip(b).fold(0, |acc, (a_i, b_i)| acc + a_i * b_i)`.
@@ -503,7 +767,7 @@ impl Fp {
     /// Implements Algorithm 2 from Patrick Longa's
     /// [ePrint 2022-367](https://eprint.iacr.org/2022/367) §3.
     #[inline]
-    pub(crate) fn sum_of_products<const T: usize>(a: [Fp; T], b: [Fp; T]) -> Fp {
+    pub(crate) fn sum_of_products<const T: usize, const VARTIME: bool>(a: [Fp; T], b: [Fp; T]) -> Fp {
         // For a single `a x b` multiplication, operand scanning (schoolbook) takes each
         // limb of `a` in turn, and multiplies it by all of the limbs of `b` to compute
         // the result as a double-width intermediate representation, which is then fully
@@ -556,23 +820,12 @@ impl Fp {
 
         // Because we represent F_p elements in non-redundant form, we need a final
         // conditional subtraction to ensure the output is in range.
-        Fp(subtract_p::<false>(&[u0, u1, u2, u3, u4, u5], &MODULUS))
+        Fp(subtract_p::<VARTIME>(&[u0, u1, u2, u3, u4, u5], &MODULUS))
     }
-
-    #[inline(always)]
-    pub(crate) fn montgomery_reduce(&self) -> [u64; 6] {
-        let mut new = [0; 12];
-        new[0] = self.0[0];
-        new[1] = self.0[1];
-        new[2] = self.0[2];
-        new[3] = self.0[3];
-        new[4] = self.0[4];
-        new[5] = self.0[5];
-        subtract_p::<false>(&wide::montgomery_reduce_wide(&new), &MODULUS)
-    }
+    
     #[inline]
-    pub const fn mul(&self, rhs: &Fp) -> Fp {
-        self.mul_unreduced(rhs).montgomery_reduce()
+    pub const fn mul<const VARTIME: bool>(&self, rhs: &Fp) -> Fp {
+        self.mul_unreduced(rhs).montgomery_reduce::<VARTIME>()
     }
 
     #[inline]
@@ -582,8 +835,8 @@ impl Fp {
 
     /// Squares this element.
     #[inline]
-    pub const fn square(&self) -> Self {
-        self.square_unreduced().montgomery_reduce()
+    pub const fn square<const VARTIME: bool>(&self) -> Self {
+        self.square_unreduced().montgomery_reduce::<VARTIME>()
     }
 
     pub const fn square_unreduced(&self) -> FpWide<0> {
@@ -591,182 +844,220 @@ impl Fp {
     }
 }
 
-#[test]
-fn test_conditional_selection() {
-    let a = Fp([1, 2, 3, 4, 5, 6]);
-    let b = Fp([7, 8, 9, 10, 11, 12]);
+#[cfg(test)]
+mod test {
+    use rand_core::RngCore;
+    use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 
-    assert_eq!(
-        ConditionallySelectable::conditional_select(&a, &b, Choice::from(0u8)),
-        a
-    );
-    assert_eq!(
-        ConditionallySelectable::conditional_select(&a, &b, Choice::from(1u8)),
-        b
-    );
-}
+    use super::{Fp, MODULUS};
 
-#[test]
-fn test_equality() {
-    fn is_equal(a: &Fp, b: &Fp) -> bool {
-        let eq = a == b;
-        let ct_eq = a.ct_eq(&b);
-
-        assert_eq!(eq, bool::from(ct_eq));
-
-        eq
+    fn gen_big(mut rng: impl RngCore) -> Fp {
+        let mut v = MODULUS;
+        v[0] -= 1 + (rng.next_u64() & (1024 - 1));
+        Fp(v)
     }
 
-    assert!(is_equal(&Fp([1, 2, 3, 4, 5, 6]), &Fp([1, 2, 3, 4, 5, 6])));
+    #[test]
+    fn test_montgomery_reduce_limit() {
+        use rand_core::SeedableRng;
+        let mut rng = rand_xorshift::XorShiftRng::from_seed([
+            0x57, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
+            0xbc, 0xe5,
+        ]);
+        for _ in 0..1_000_000 {
+            let a = gen_big(&mut rng);
+            let mut v = a.montgomery_reduce();
+            let mut modulus = MODULUS;
+            v.reverse();
+            modulus.reverse();
+            assert!(v < modulus, "{v:?} >= {modulus:?}");
+        }
+        for _ in 0..1_000_000 {
+            let a = Fp::random(&mut rng);
+            let mut v = a.montgomery_reduce();
+            let mut modulus = MODULUS;
+            v.reverse();
+            modulus.reverse();
+            assert!(v < modulus, "{v:?} >= {modulus:?}");
+        }
+    }
 
-    assert!(!is_equal(&Fp([7, 2, 3, 4, 5, 6]), &Fp([1, 2, 3, 4, 5, 6])));
-    assert!(!is_equal(&Fp([1, 7, 3, 4, 5, 6]), &Fp([1, 2, 3, 4, 5, 6])));
-    assert!(!is_equal(&Fp([1, 2, 7, 4, 5, 6]), &Fp([1, 2, 3, 4, 5, 6])));
-    assert!(!is_equal(&Fp([1, 2, 3, 7, 5, 6]), &Fp([1, 2, 3, 4, 5, 6])));
-    assert!(!is_equal(&Fp([1, 2, 3, 4, 7, 6]), &Fp([1, 2, 3, 4, 5, 6])));
-    assert!(!is_equal(&Fp([1, 2, 3, 4, 5, 7]), &Fp([1, 2, 3, 4, 5, 6])));
-}
+    #[test]
+    fn test_conditional_selection() {
+        let a = Fp([1, 2, 3, 4, 5, 6]);
+        let b = Fp([7, 8, 9, 10, 11, 12]);
 
-#[test]
-fn test_squaring() {
-    let a = Fp([
-        0xd215_d276_8e83_191b,
-        0x5085_d80f_8fb2_8261,
-        0xce9a_032d_df39_3a56,
-        0x3e9c_4fff_2ca0_c4bb,
-        0x6436_b6f7_f4d9_5dfb,
-        0x1060_6628_ad4a_4d90,
-    ]);
-    let b = Fp([
-        0x33d9_c42a_3cb3_e235,
-        0xdad1_1a09_4c4c_d455,
-        0xa2f1_44bd_729a_aeba,
-        0xd415_0932_be9f_feac,
-        0xe27b_c7c4_7d44_ee50,
-        0x14b6_a78d_3ec7_a560,
-    ]);
+        assert_eq!(
+            ConditionallySelectable::conditional_select(&a, &b, Choice::from(0u8)),
+            a
+        );
+        assert_eq!(
+            ConditionallySelectable::conditional_select(&a, &b, Choice::from(1u8)),
+            b
+        );
+    }
 
-    assert_eq!(a.square(), b);
-}
+    #[test]
+    fn test_equality() {
+        fn is_equal(a: &Fp, b: &Fp) -> bool {
+            let eq = a == b;
+            let ct_eq = a.ct_eq(&b);
 
-#[test]
-fn test_multiplication() {
-    let a = Fp([
-        0x0397_a383_2017_0cd4,
-        0x734c_1b2c_9e76_1d30,
-        0x5ed2_55ad_9a48_beb5,
-        0x095a_3c6b_22a7_fcfc,
-        0x2294_ce75_d4e2_6a27,
-        0x1333_8bd8_7001_1ebb,
-    ]);
-    let b = Fp([
-        0xb9c3_c7c5_b119_6af7,
-        0x2580_e208_6ce3_35c1,
-        0xf49a_ed3d_8a57_ef42,
-        0x41f2_81e4_9846_e878,
-        0xe076_2346_c384_52ce,
-        0x0652_e893_26e5_7dc0,
-    ]);
-    let c = Fp([
-        0xf96e_f3d7_11ab_5355,
-        0xe8d4_59ea_00f1_48dd,
-        0x53f7_354a_5f00_fa78,
-        0x9e34_a4f3_125c_5f83,
-        0x3fbe_0c47_ca74_c19e,
-        0x01b0_6a8b_bd4a_dfe4,
-    ]);
+            assert_eq!(eq, bool::from(ct_eq));
 
-    assert_eq!(a * b, c);
-}
+            eq
+        }
 
-#[test]
-fn test_addition() {
-    let a = Fp([
-        0x5360_bb59_7867_8032,
-        0x7dd2_75ae_799e_128e,
-        0x5c5b_5071_ce4f_4dcf,
-        0xcdb2_1f93_078d_bb3e,
-        0xc323_65c5_e73f_474a,
-        0x115a_2a54_89ba_be5b,
-    ]);
-    let b = Fp([
-        0x9fd2_8773_3d23_dda0,
-        0xb16b_f2af_738b_3554,
-        0x3e57_a75b_d3cc_6d1d,
-        0x900b_c0bd_627f_d6d6,
-        0xd319_a080_efb2_45fe,
-        0x15fd_caa4_e4bb_2091,
-    ]);
-    let c = Fp([
-        0x3934_42cc_b58b_b327,
-        0x1092_685f_3bd5_47e3,
-        0x3382_252c_ab6a_c4c9,
-        0xf946_94cb_7688_7f55,
-        0x4b21_5e90_93a5_e071,
-        0x0d56_e30f_34f5_f853,
-    ]);
+        assert!(is_equal(&Fp([1, 2, 3, 4, 5, 6]), &Fp([1, 2, 3, 4, 5, 6])));
 
-    assert_eq!(a + b, c);
-}
+        assert!(!is_equal(&Fp([7, 2, 3, 4, 5, 6]), &Fp([1, 2, 3, 4, 5, 6])));
+        assert!(!is_equal(&Fp([1, 7, 3, 4, 5, 6]), &Fp([1, 2, 3, 4, 5, 6])));
+        assert!(!is_equal(&Fp([1, 2, 7, 4, 5, 6]), &Fp([1, 2, 3, 4, 5, 6])));
+        assert!(!is_equal(&Fp([1, 2, 3, 7, 5, 6]), &Fp([1, 2, 3, 4, 5, 6])));
+        assert!(!is_equal(&Fp([1, 2, 3, 4, 7, 6]), &Fp([1, 2, 3, 4, 5, 6])));
+        assert!(!is_equal(&Fp([1, 2, 3, 4, 5, 7]), &Fp([1, 2, 3, 4, 5, 6])));
+    }
 
-#[test]
-fn test_subtraction() {
-    let a = Fp([
-        0x5360_bb59_7867_8032,
-        0x7dd2_75ae_799e_128e,
-        0x5c5b_5071_ce4f_4dcf,
-        0xcdb2_1f93_078d_bb3e,
-        0xc323_65c5_e73f_474a,
-        0x115a_2a54_89ba_be5b,
-    ]);
-    let b = Fp([
-        0x9fd2_8773_3d23_dda0,
-        0xb16b_f2af_738b_3554,
-        0x3e57_a75b_d3cc_6d1d,
-        0x900b_c0bd_627f_d6d6,
-        0xd319_a080_efb2_45fe,
-        0x15fd_caa4_e4bb_2091,
-    ]);
-    let c = Fp([
-        0x6d8d_33e6_3b43_4d3d,
-        0xeb12_82fd_b766_dd39,
-        0x8534_7bb6_f133_d6d5,
-        0xa21d_aa5a_9892_f727,
-        0x3b25_6cfb_3ad8_ae23,
-        0x155d_7199_de7f_8464,
-    ]);
+    #[test]
+    fn test_squaring() {
+        let a = Fp([
+            0xd215_d276_8e83_191b,
+            0x5085_d80f_8fb2_8261,
+            0xce9a_032d_df39_3a56,
+            0x3e9c_4fff_2ca0_c4bb,
+            0x6436_b6f7_f4d9_5dfb,
+            0x1060_6628_ad4a_4d90,
+        ]);
+        let b = Fp([
+            0x33d9_c42a_3cb3_e235,
+            0xdad1_1a09_4c4c_d455,
+            0xa2f1_44bd_729a_aeba,
+            0xd415_0932_be9f_feac,
+            0xe27b_c7c4_7d44_ee50,
+            0x14b6_a78d_3ec7_a560,
+        ]);
 
-    assert_eq!(a - b, c);
-}
+        assert_eq!(a.square::<false>(), b);
+    }
 
-#[test]
-fn test_negation() {
-    let a = Fp([
-        0x5360_bb59_7867_8032,
-        0x7dd2_75ae_799e_128e,
-        0x5c5b_5071_ce4f_4dcf,
-        0xcdb2_1f93_078d_bb3e,
-        0xc323_65c5_e73f_474a,
-        0x115a_2a54_89ba_be5b,
-    ]);
-    let b = Fp([
-        0x669e_44a6_8798_2a79,
-        0xa0d9_8a50_37b5_ed71,
-        0x0ad5_822f_2861_a854,
-        0x96c5_2bf1_ebf7_5781,
-        0x87f8_41f0_5c0c_658c,
-        0x08a6_e795_afc5_283e,
-    ]);
+    #[test]
+    fn test_multiplication() {
+        let a = Fp([
+            0x0397_a383_2017_0cd4,
+            0x734c_1b2c_9e76_1d30,
+            0x5ed2_55ad_9a48_beb5,
+            0x095a_3c6b_22a7_fcfc,
+            0x2294_ce75_d4e2_6a27,
+            0x1333_8bd8_7001_1ebb,
+        ]);
+        let b = Fp([
+            0xb9c3_c7c5_b119_6af7,
+            0x2580_e208_6ce3_35c1,
+            0xf49a_ed3d_8a57_ef42,
+            0x41f2_81e4_9846_e878,
+            0xe076_2346_c384_52ce,
+            0x0652_e893_26e5_7dc0,
+        ]);
+        let c = Fp([
+            0xf96e_f3d7_11ab_5355,
+            0xe8d4_59ea_00f1_48dd,
+            0x53f7_354a_5f00_fa78,
+            0x9e34_a4f3_125c_5f83,
+            0x3fbe_0c47_ca74_c19e,
+            0x01b0_6a8b_bd4a_dfe4,
+        ]);
 
-    assert_eq!(-a, b);
-}
+        assert_eq!(a * b, c);
+    }
 
-#[test]
-fn test_debug() {
-    assert_eq!(
+    #[test]
+    fn test_addition() {
+        let a = Fp::<0>([
+            0x5360_bb59_7867_8032,
+            0x7dd2_75ae_799e_128e,
+            0x5c5b_5071_ce4f_4dcf,
+            0xcdb2_1f93_078d_bb3e,
+            0xc323_65c5_e73f_474a,
+            0x115a_2a54_89ba_be5b,
+        ]);
+        let b = Fp([
+            0x9fd2_8773_3d23_dda0,
+            0xb16b_f2af_738b_3554,
+            0x3e57_a75b_d3cc_6d1d,
+            0x900b_c0bd_627f_d6d6,
+            0xd319_a080_efb2_45fe,
+            0x15fd_caa4_e4bb_2091,
+        ]);
+        let c = Fp([
+            0x3934_42cc_b58b_b327,
+            0x1092_685f_3bd5_47e3,
+            0x3382_252c_ab6a_c4c9,
+            0xf946_94cb_7688_7f55,
+            0x4b21_5e90_93a5_e071,
+            0x0d56_e30f_34f5_f853,
+        ]);
+
+        assert_eq!(a + b, c);
+    }
+
+    #[test]
+    fn test_subtraction() {
+        let a = Fp::<0>([
+            0x5360_bb59_7867_8032,
+            0x7dd2_75ae_799e_128e,
+            0x5c5b_5071_ce4f_4dcf,
+            0xcdb2_1f93_078d_bb3e,
+            0xc323_65c5_e73f_474a,
+            0x115a_2a54_89ba_be5b,
+        ]);
+        let b = Fp([
+            0x9fd2_8773_3d23_dda0,
+            0xb16b_f2af_738b_3554,
+            0x3e57_a75b_d3cc_6d1d,
+            0x900b_c0bd_627f_d6d6,
+            0xd319_a080_efb2_45fe,
+            0x15fd_caa4_e4bb_2091,
+        ]);
+        let c = Fp([
+            0x6d8d_33e6_3b43_4d3d,
+            0xeb12_82fd_b766_dd39,
+            0x8534_7bb6_f133_d6d5,
+            0xa21d_aa5a_9892_f727,
+            0x3b25_6cfb_3ad8_ae23,
+            0x155d_7199_de7f_8464,
+        ]);
+
+        assert_eq!(a - b, c);
+    }
+
+    #[test]
+    fn test_negation() {
+        let a = Fp([
+            0x5360_bb59_7867_8032,
+            0x7dd2_75ae_799e_128e,
+            0x5c5b_5071_ce4f_4dcf,
+            0xcdb2_1f93_078d_bb3e,
+            0xc323_65c5_e73f_474a,
+            0x115a_2a54_89ba_be5b,
+        ]);
+        let b = Fp([
+            0x669e_44a6_8798_2a79,
+            0xa0d9_8a50_37b5_ed71,
+            0x0ad5_822f_2861_a854,
+            0x96c5_2bf1_ebf7_5781,
+            0x87f8_41f0_5c0c_658c,
+            0x08a6_e795_afc5_283e,
+        ]);
+
+        assert_eq!(-a, b);
+    }
+
+    #[test]
+    fn test_debug() {
+        assert_eq!(
         format!(
             "{:?}",
-            Fp([
+            Fp::<0>([
                 0x5360_bb59_7867_8032,
                 0x7dd2_75ae_799e_128e,
                 0x5c5b_5071_ce4f_4dcf,
@@ -777,144 +1068,145 @@ fn test_debug() {
         ),
         "0x104bf052ad3bc99bcb176c24a06a6c3aad4eaf2308fc4d282e106c84a757d061052630515305e59bdddf8111bfdeb704"
     );
-}
-
-#[test]
-fn test_from_bytes() {
-    let mut a = Fp([
-        0xdc90_6d9b_e3f9_5dc8,
-        0x8755_caf7_4596_91a1,
-        0xcff1_a7f4_e958_3ab3,
-        0x9b43_821f_849e_2284,
-        0xf575_54f3_a297_4f3f,
-        0x085d_bea8_4ed4_7f79,
-    ]);
-
-    for _ in 0..100 {
-        a = a.square();
-        let tmp = a.to_bytes();
-        let b = Fp::from_bytes(&tmp).unwrap();
-
-        assert_eq!(a, b);
     }
 
-    assert_eq!(
-        -Fp::one(),
-        Fp::from_bytes(&[
-            26, 1, 17, 234, 57, 127, 230, 154, 75, 27, 167, 182, 67, 75, 172, 215, 100, 119, 75,
-            132, 243, 133, 18, 191, 103, 48, 210, 160, 246, 176, 246, 36, 30, 171, 255, 254, 177,
-            83, 255, 255, 185, 254, 255, 255, 255, 255, 170, 170
-        ])
-        .unwrap()
-    );
+    #[test]
+    fn test_from_bytes() {
+        let mut a = Fp::<0>([
+            0xdc90_6d9b_e3f9_5dc8,
+            0x8755_caf7_4596_91a1,
+            0xcff1_a7f4_e958_3ab3,
+            0x9b43_821f_849e_2284,
+            0xf575_54f3_a297_4f3f,
+            0x085d_bea8_4ed4_7f79,
+        ]);
 
-    assert!(bool::from(
-        Fp::from_bytes(&[
-            27, 1, 17, 234, 57, 127, 230, 154, 75, 27, 167, 182, 67, 75, 172, 215, 100, 119, 75,
-            132, 243, 133, 18, 191, 103, 48, 210, 160, 246, 176, 246, 36, 30, 171, 255, 254, 177,
-            83, 255, 255, 185, 254, 255, 255, 255, 255, 170, 170
-        ])
-        .is_none()
-    ));
+        for _ in 0..100 {
+            a = a.square::<false>();
+            let tmp = a.to_bytes();
+            let b = Fp::from_bytes(&tmp).unwrap();
 
-    assert!(bool::from(Fp::from_bytes(&[0xff; 48]).is_none()));
-}
+            assert_eq!(a, b);
+        }
 
-#[test]
-fn test_sqrt() {
-    // a = 4
-    let a = Fp::from_raw_unchecked([
-        0xaa27_0000_000c_fff3,
-        0x53cc_0032_fc34_000a,
-        0x478f_e97a_6b0a_807f,
-        0xb1d3_7ebe_e6ba_24d7,
-        0x8ec9_733b_bf78_ab2f,
-        0x09d6_4551_3d83_de7e,
-    ]);
+        assert_eq!(
+            -Fp::one(),
+            Fp::from_bytes(&[
+                26, 1, 17, 234, 57, 127, 230, 154, 75, 27, 167, 182, 67, 75, 172, 215, 100, 119,
+                75, 132, 243, 133, 18, 191, 103, 48, 210, 160, 246, 176, 246, 36, 30, 171, 255,
+                254, 177, 83, 255, 255, 185, 254, 255, 255, 255, 255, 170, 170
+            ])
+            .unwrap()
+        );
 
-    assert_eq!(
-        // sqrt(4) = -2
-        -a.sqrt().unwrap(),
-        // 2
-        Fp::from_raw_unchecked([
-            0x3213_0000_0006_554f,
-            0xb93c_0018_d6c4_0005,
-            0x5760_5e0d_b0dd_bb51,
-            0x8b25_6521_ed1f_9bcb,
-            0x6cf2_8d79_0162_2c03,
-            0x11eb_ab9d_bb81_e28c,
-        ])
-    );
-}
+        assert!(bool::from(
+            Fp::from_bytes(&[
+                27, 1, 17, 234, 57, 127, 230, 154, 75, 27, 167, 182, 67, 75, 172, 215, 100, 119,
+                75, 132, 243, 133, 18, 191, 103, 48, 210, 160, 246, 176, 246, 36, 30, 171, 255,
+                254, 177, 83, 255, 255, 185, 254, 255, 255, 255, 255, 170, 170
+            ])
+            .is_none()
+        ));
 
-#[test]
-fn test_inversion() {
-    let a = Fp([
-        0x43b4_3a50_78ac_2076,
-        0x1ce0_7630_46f8_962b,
-        0x724a_5276_486d_735c,
-        0x6f05_c2a6_282d_48fd,
-        0x2095_bd5b_b4ca_9331,
-        0x03b3_5b38_94b0_f7da,
-    ]);
-    let b = Fp([
-        0x69ec_d704_0952_148f,
-        0x985c_cc20_2219_0f55,
-        0xe19b_ba36_a9ad_2f41,
-        0x19bb_16c9_5219_dbd8,
-        0x14dc_acfd_fb47_8693,
-        0x115f_f58a_fff9_a8e1,
-    ]);
+        assert!(bool::from(Fp::from_bytes(&[0xff; 48]).is_none()));
+    }
 
-    assert_eq!(a.invert().unwrap(), b);
-    assert!(bool::from(Fp::zero().invert().is_none()));
-}
+    #[test]
+    fn test_sqrt() {
+        // a = 4
+        let a = Fp::from_raw_unchecked([
+            0xaa27_0000_000c_fff3,
+            0x53cc_0032_fc34_000a,
+            0x478f_e97a_6b0a_807f,
+            0xb1d3_7ebe_e6ba_24d7,
+            0x8ec9_733b_bf78_ab2f,
+            0x09d6_4551_3d83_de7e,
+        ]);
 
-#[test]
-fn test_lexicographic_largest() {
-    assert!(!bool::from(Fp::zero().lexicographically_largest()));
-    assert!(!bool::from(Fp::one().lexicographically_largest()));
-    assert!(!bool::from(
-        Fp::from_raw_unchecked([
-            0xa1fa_ffff_fffe_5557,
-            0x995b_fff9_76a3_fffe,
-            0x03f4_1d24_d174_ceb4,
-            0xf654_7998_c199_5dbd,
-            0x778a_468f_507a_6034,
-            0x0205_5993_1f7f_8103
-        ])
-        .lexicographically_largest()
-    ));
-    assert!(bool::from(
-        Fp::from_raw_unchecked([
-            0x1804_0000_0001_5554,
-            0x8550_0005_3ab0_0001,
-            0x633c_b57c_253c_276f,
-            0x6e22_d1ec_31eb_b502,
-            0xd391_6126_f2d1_4ca2,
-            0x17fb_b857_1a00_6596,
-        ])
-        .lexicographically_largest()
-    ));
-    assert!(bool::from(
-        Fp::from_raw_unchecked([
-            0x43f5_ffff_fffc_aaae,
-            0x32b7_fff2_ed47_fffd,
-            0x07e8_3a49_a2e9_9d69,
-            0xeca8_f331_8332_bb7a,
-            0xef14_8d1e_a0f4_c069,
-            0x040a_b326_3eff_0206,
-        ])
-        .lexicographically_largest()
-    ));
-}
+        assert_eq!(
+            // sqrt(4) = -2
+            -a.sqrt().unwrap(),
+            // 2
+            Fp::from_raw_unchecked([
+                0x3213_0000_0006_554f,
+                0xb93c_0018_d6c4_0005,
+                0x5760_5e0d_b0dd_bb51,
+                0x8b25_6521_ed1f_9bcb,
+                0x6cf2_8d79_0162_2c03,
+                0x11eb_ab9d_bb81_e28c,
+            ])
+        );
+    }
 
-#[cfg(feature = "zeroize")]
-#[test]
-fn test_zeroize() {
-    use zeroize::Zeroize;
+    #[test]
+    fn test_inversion() {
+        let a = Fp([
+            0x43b4_3a50_78ac_2076,
+            0x1ce0_7630_46f8_962b,
+            0x724a_5276_486d_735c,
+            0x6f05_c2a6_282d_48fd,
+            0x2095_bd5b_b4ca_9331,
+            0x03b3_5b38_94b0_f7da,
+        ]);
+        let b = Fp([
+            0x69ec_d704_0952_148f,
+            0x985c_cc20_2219_0f55,
+            0xe19b_ba36_a9ad_2f41,
+            0x19bb_16c9_5219_dbd8,
+            0x14dc_acfd_fb47_8693,
+            0x115f_f58a_fff9_a8e1,
+        ]);
 
-    let mut a = Fp::one();
-    a.zeroize();
-    assert!(bool::from(a.is_zero()));
+        assert_eq!(a.invert().unwrap(), b);
+        assert!(bool::from(Fp::zero().invert().is_none()));
+    }
+
+    #[test]
+    fn test_lexicographic_largest() {
+        assert!(!bool::from(Fp::zero().lexicographically_largest()));
+        assert!(!bool::from(Fp::one().lexicographically_largest()));
+        assert!(!bool::from(
+            Fp::from_raw_unchecked([
+                0xa1fa_ffff_fffe_5557,
+                0x995b_fff9_76a3_fffe,
+                0x03f4_1d24_d174_ceb4,
+                0xf654_7998_c199_5dbd,
+                0x778a_468f_507a_6034,
+                0x0205_5993_1f7f_8103
+            ])
+            .lexicographically_largest()
+        ));
+        assert!(bool::from(
+            Fp::from_raw_unchecked([
+                0x1804_0000_0001_5554,
+                0x8550_0005_3ab0_0001,
+                0x633c_b57c_253c_276f,
+                0x6e22_d1ec_31eb_b502,
+                0xd391_6126_f2d1_4ca2,
+                0x17fb_b857_1a00_6596,
+            ])
+            .lexicographically_largest()
+        ));
+        assert!(bool::from(
+            Fp::from_raw_unchecked([
+                0x43f5_ffff_fffc_aaae,
+                0x32b7_fff2_ed47_fffd,
+                0x07e8_3a49_a2e9_9d69,
+                0xeca8_f331_8332_bb7a,
+                0xef14_8d1e_a0f4_c069,
+                0x040a_b326_3eff_0206,
+            ])
+            .lexicographically_largest()
+        ));
+    }
+
+    #[cfg(feature = "zeroize")]
+    #[test]
+    fn test_zeroize() {
+        use zeroize::Zeroize;
+
+        let mut a = Fp::one();
+        a.zeroize();
+        assert!(bool::from(a.is_zero()));
+    }
 }

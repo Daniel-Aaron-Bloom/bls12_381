@@ -102,13 +102,13 @@ fn test_pairing_result_against_relic() {
     use super::fp2::Fp2;
     use super::fp6::Fp6;
 
-    let res = pairing(&a, &b);
+    let res = pairing::<false>(&a, &b);
 
     let prep = G2Prepared::from(b);
 
     assert_eq!(
         res,
-        multi_miller_loop(&[(&a, &prep)]).final_exponentiation()
+        multi_miller_loop(&[(&a, &prep)]).final_exponentiation::<false>()
     );
 
     assert_eq!(
