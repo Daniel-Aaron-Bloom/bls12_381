@@ -1,75 +1,18 @@
 //! This module provides an implementation of the BLS12-381 base field `GF(p)`
 //! where `p = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab`
+#![allow(missing_docs)]
 
 use core::fmt;
 use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 use rand_core::RngCore;
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 
-use crate::util::{adc, borrowing_sub, carrying_add, mac, slc};
+use crate::util::{adc, sbb, borrowing_sub, carrying_add, mac, slc, Mag, DoubleOp, Never, NonZero, Ops, MontOp, OtherMag};
 
 pub mod wide;
 use wide::FpWide;
 
-// Hack to get the ! type on stable
-#[doc(hidden)]
-pub trait HasOutput {
-    type Output;
-}
-impl<O> HasOutput for fn() -> O {
-    type Output = O;
-}
-type Never = <fn() -> ! as HasOutput>::Output;
-
-#[doc(hidden)]
-pub trait NonZero {}
-
-#[doc(hidden)]
-pub trait Mag<Data>: Sized {
-    type Prev: Mag<Data>;
-    type Next: Mag<Data>;
-
-    type Mag<const MAGNITUDE: usize>;
-
-    /// A multiple of the prime that is larger than this element could be
-    const MODULUS: Data;
-
-    fn make(v: Data) -> Self;
-    fn data(&self) -> &Data;
-    /// Negates an element by subtracting it from the `Self::MODULUS`
-    fn negate(&self) -> Self;
-}
-
-impl<Data> Mag<Data> for Never {
-    type Prev = Never;
-    type Next = Never;
-    type Mag<const MAGNITUDE: usize> = Never;
-
-    const MODULUS: Data = unimplemented!();
-
-    #[inline(always)]
-    fn make(_: Data) -> Self {
-        unimplemented!()
-    }
-    #[inline(always)]
-    fn data(&self) -> &Data {
-        unreachable!()
-    }
-    #[inline(always)]
-    fn negate(&self) -> Self {
-        unreachable!()
-    }
-}
-
-pub trait Ops<Data, const MAG: usize>: Mag<Data> {
-    type OpOut: Mag<Data>;
-    fn add(lhs: &Self, rhs: &Self::Mag<MAG>) -> Self::OpOut
-    where
-        Self::Mag<MAG>: Mag<Data>;
-    fn sub(lhs: &Self, rhs: &Self::Mag<MAG>) -> Self::OpOut
-    where
-        Self::Mag<MAG>: Mag<Data>;
-}
+use self::wide::{square_wide, montgomery_reduce_wide, mul_wide};
 
 #[inline]
 const fn negate(v: &[u64; 6], modulus: &[u64; 6]) -> [u64; 6] {
@@ -78,239 +21,84 @@ const fn negate(v: &[u64; 6], modulus: &[u64; 6]) -> [u64; 6] {
     let (d2, borrow) = borrowing_sub(modulus[2], v[2], borrow);
     let (d3, borrow) = borrowing_sub(modulus[3], v[3], borrow);
     let (d4, borrow) = borrowing_sub(modulus[4], v[4], borrow);
-    let (d5, _) = borrowing_sub(modulus[5], v[5], borrow);
+    let (d5, _borrow) = borrowing_sub(modulus[5], v[5], borrow);
+
+    if cfg!(debug_assertions) && _borrow {
+        panic!("borrow != 0");
+    }
+
     [d0, d1, d2, d3, d4, d5]
 }
 
 #[inline]
-const fn add(lhs: &[u64; 6], rhs: &[u64; 6]) -> [u64; 6] {
+const fn add_c(lhs: &[u64; 6], rhs: &[u64; 6]) -> ([u64; 6], bool) {
     let (d0, carry) = adc(lhs[0], rhs[0], 0);
     let (d1, carry) = adc(lhs[1], rhs[1], carry);
     let (d2, carry) = adc(lhs[2], rhs[2], carry);
     let (d3, carry) = adc(lhs[3], rhs[3], carry);
     let (d4, carry) = adc(lhs[4], rhs[4], carry);
-    let (d5, _) = adc(lhs[5], rhs[5], carry);
+    let (d5, carry) = adc(lhs[5], rhs[5], carry);
 
-    [d0, d1, d2, d3, d4, d5]
+    ([d0, d1, d2, d3, d4, d5], carry != 0)
 }
 
-// The internal representation of this type is six 64-bit unsigned
-// integers in little-endian order. `Fp` values are always in
-// Montgomery form; i.e., Scalar(a) = aR mod p, with R = 2^384.
-#[derive(Copy, Clone)]
-pub struct Fp<const MAGNITUDE: usize = 0>(pub(crate) [u64; 6]);
+#[inline]
+const fn add(lhs: &[u64; 6], rhs: &[u64; 6]) -> [u64; 6] {
+    let (v, _carry) = add_c(lhs, rhs);
 
-impl Mag<[u64; 6]> for Fp<0> {
-    type Prev = Never;
-    type Next = Fp<1>;
-    type Mag<const MAGNITUDE: usize> = Fp<MAGNITUDE>;
+    if cfg!(debug_assertions) && _carry {
+        panic!("carry != 0");
+    }
 
-    /// A multiple of the prime that is larger than this element could be (p).
-    const MODULUS: [u64; 6] = MODULUS;
-
-    #[inline(always)]
-    fn make(v: [u64; 6]) -> Self {
-        Self(v)
-    }
-    #[inline(always)]
-    fn data(&self) -> &[u64; 6] {
-        &self.0
-    }
-    #[inline(always)]
-    fn negate(&self) -> Self {
-        Self::make(negate(self.data(), &Self::MODULUS))
-    }
+    v
 }
 
-macro_rules! mag_impl {
-    ($($($ua:literal),+ $(,)?)?) => {$($(
-impl Mag<[u64; 6]> for Fp<$ua> {
-    type Prev = Fp<{$ua - 1}>;
-    type Next = Fp<{$ua + 1}>;
-    type Mag<const MAGNITUDE: usize> = Fp<MAGNITUDE>;
+#[inline]
+const fn sub<const VARTIME: bool>(lhs: &[u64; 6], rhs: &[u64; 6], mut modulus: [u64; 6]) -> [u64; 6] {
+    let (r0, borrow) = borrowing_sub(lhs[0], rhs[0], false);
+    let (r1, borrow) = borrowing_sub(lhs[1], rhs[1], borrow);
+    let (r2, borrow) = borrowing_sub(lhs[2], rhs[2], borrow);
+    let (r3, borrow) = borrowing_sub(lhs[3], rhs[3], borrow);
+    let (r4, borrow) = borrowing_sub(lhs[4], rhs[4], borrow);
+    let (r5, borrow) = borrowing_sub(lhs[5], rhs[5], borrow);
 
-    /// A multiple of the prime that is larger than this element could be (p).
-    const MODULUS: [u64; 6] = add(&Self::Prev::MODULUS, &MODULUS);
-
-    #[inline(always)]
-    fn make(v: [u64; 6]) -> Self {
-        Self(v)
-    }
-    #[inline(always)]
-    fn data(&self) -> &[u64; 6] {
-        &self.0
-    }
-    #[inline(always)]
-    fn negate(&self) -> Self {
-        Self::make(negate(self.data(), &Self::MODULUS))
-    }
-}
-
-impl NonZero for Fp<$ua> {}
-    )+)?};
-}
-mag_impl! {1, 2, 3, 4, 5, 6, 7}
-impl Mag<[u64; 6]> for Fp<8> {
-    type Prev = Fp<7>;
-    type Next = Never;
-    type Mag<const MAGNITUDE: usize> = Fp<MAGNITUDE>;
-
-    /// A multiple of the prime that is larger than this element could be (p).
-    const MODULUS: [u64; 6] = add(&Self::Prev::MODULUS, &MODULUS);
-
-    #[inline(always)]
-    fn make(v: [u64; 6]) -> Self {
-        Self(v)
-    }
-    #[inline(always)]
-    fn data(&self) -> &[u64; 6] {
-        &self.0
-    }
-    #[inline(always)]
-    fn negate(&self) -> Self {
-        Self::make(negate(self.data(), &Self::MODULUS))
-    }
-}
-
-impl<const MAG2: usize> Ops<[u64; 6], MAG2> for Fp<0>
-where
-    Fp<MAG2>: Mag<[u64; 6]>,
-{
-    type OpOut = <Fp<MAG2> as Mag<[u64; 6]>>::Next;
-    #[inline(always)]
-    fn add(lhs: &Self, rhs: &Fp<MAG2>) -> Self::OpOut {
-        Mag::make(add(&lhs.0, &rhs.0))
-    }
-    #[inline(always)]
-    fn sub(lhs: &Self, rhs: &Fp<MAG2>) -> Self::OpOut {
-        Mag::make(add(&lhs.0, &rhs.negate().0))
-    }
-}
-
-impl<const MAG1: usize, const MAG2: usize> Ops<[u64; 6], MAG2> for Fp<MAG1>
-where
-    Fp<MAG1>: Mag<[u64; 6]> + NonZero,
-    <Fp<MAG1> as Mag<[u64; 6]>>::Prev: Ops<[u64; 6], MAG2>,
-    Fp<MAG2>: Mag<[u64; 6]>,
-{
-    type OpOut =
-        <<<Fp<MAG1> as Mag<[u64; 6]>>::Prev as Ops<[u64; 6], MAG2>>::OpOut as Mag<[u64; 6]>>::Next;
-    #[inline(always)]
-    fn add(lhs: &Self, rhs: &Self::Mag<MAG2>) -> Self::OpOut
-    where
-        Self::Mag<MAG2>: Mag<[u64; 6]>,
-    {
-        Mag::make(add(lhs.data(), rhs.data()))
-    }
-    #[inline(always)]
-    fn sub(lhs: &Self, rhs: &Self::Mag<MAG2>) -> Self::OpOut
-    where
-        Self::Mag<MAG2>: Mag<[u64; 6]>,
-    {
-        Mag::make(add(&lhs.0, &(rhs.negate()).data()))
-    }
-}
-
-impl<'a, 'b, const MAG1: usize, const MAG2: usize> Add<&'b Fp<MAG2>> for &'a Fp<MAG1>
-where
-    Fp<MAG1>: NonZero + Ops<[u64; 6], MAG2>,
-    <Fp<MAG1> as Mag<[u64; 6]>>::Mag<MAG2>: Mag<[u64; 6]>,
-    for<'j> &'j Fp<MAG2>: Into<&'j <Fp<MAG1> as Mag<[u64; 6]>>::Mag<MAG2>>,
-{
-    type Output = <Fp<MAG1> as Ops<[u64; 6], MAG2>>::OpOut;
-
-    #[inline(always)]
-    fn add(self, rhs: &'b Fp<MAG2>) -> Self::Output {
-        Ops::add(self, rhs.into())
-    }
-}
-impl<'a, 'b, const MAG1: usize, const MAG2: usize> Sub<&'b Fp<MAG2>> for &'a Fp<MAG1>
-where
-    Fp<MAG1>: NonZero + Ops<[u64; 6], MAG2>,
-    <Fp<MAG1> as Mag<[u64; 6]>>::Mag<MAG2>: Mag<[u64; 6]>,
-    for<'j> &'j Fp<MAG2>: Into<&'j <Fp<MAG1> as Mag<[u64; 6]>>::Mag<MAG2>>,
-{
-    type Output = <Fp<MAG1> as Ops<[u64; 6], MAG2>>::OpOut;
-
-    #[inline(always)]
-    fn sub(self, rhs: &'b Fp<MAG2>) -> Self::Output {
-        Ops::sub(self, rhs.into())
-    }
-}
-impl_binops_additive_output! {
-{const MAG1: usize, const MAG2: usize}
-{where Fp<MAG1>: NonZero+Ops<[u64; 6], MAG2>, <Fp<MAG1> as Mag<[u64; 6]>>::Mag<MAG2>: Mag<[u64; 6]>, for<'j> &'j Fp<MAG2>: Into<&'j <Fp<MAG1> as Mag<[u64; 6]>>::Mag<MAG2>>}
-{Fp<MAG1>}
-{Fp<MAG2>}}
-
-impl<const MAGNITUDE: usize> fmt::Debug for Fp<MAGNITUDE> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let tmp = self.to_bytes();
-        write!(f, "0x")?;
-        for &b in tmp.iter() {
-            write!(f, "{:02x}", b)?;
+    let v = [r0, r1, r2, r3, r4, r5];
+    match VARTIME {
+        true if borrow => add_c(&v, &modulus).0,
+        true => v,
+        false => {
+            // If underflow occurred on the final limb, borrow = 0xfff...fff, otherwise
+            // borrow = 0x000...000. Thus, we use it as a mask!
+            let borrow = -(borrow as i64) as u64;
+            modulus[0] &= borrow;
+            modulus[1] &= borrow;
+            modulus[2] &= borrow;
+            modulus[3] &= borrow;
+            modulus[4] &= borrow;
+            modulus[5] &= borrow;
+            add_c(&v, &modulus).0
         }
-        Ok(())
-    }
-}
-
-impl Default for Fp {
-    fn default() -> Self {
-        Fp::zero()
-    }
-}
-
-#[cfg(feature = "zeroize")]
-impl zeroize::DefaultIsZeroes for Fp {}
-
-impl<const MAGNITUDE: usize> ConstantTimeEq for Fp<MAGNITUDE> {
-    fn ct_eq(&self, other: &Self) -> Choice {
-        self.0[0].ct_eq(&other.0[0])
-            & self.0[1].ct_eq(&other.0[1])
-            & self.0[2].ct_eq(&other.0[2])
-            & self.0[3].ct_eq(&other.0[3])
-            & self.0[4].ct_eq(&other.0[4])
-            & self.0[5].ct_eq(&other.0[5])
-    }
-}
-
-impl Eq for Fp {}
-impl PartialEq for Fp {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        bool::from(self.ct_eq(other))
-    }
-}
-
-impl ConditionallySelectable for Fp {
-    fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
-        Fp([
-            u64::conditional_select(&a.0[0], &b.0[0], choice),
-            u64::conditional_select(&a.0[1], &b.0[1], choice),
-            u64::conditional_select(&a.0[2], &b.0[2], choice),
-            u64::conditional_select(&a.0[3], &b.0[3], choice),
-            u64::conditional_select(&a.0[4], &b.0[4], choice),
-            u64::conditional_select(&a.0[5], &b.0[5], choice),
-        ])
     }
 }
 
 #[inline]
-const fn double(v: &[u64; 6]) -> [u64; 6] {
-    let (d0, carry) = slc(v[0], 1, 0);
-    let (d1, carry) = slc(v[1], 1, carry);
-    let (d2, carry) = slc(v[2], 1, carry);
-    let (d3, carry) = slc(v[3], 1, carry);
-    let (d4, carry) = slc(v[4], 1, carry);
-    let (d5, _carry) = slc(v[5], 1, carry);
+const fn double(v: &[u64; 6], pow: u32) -> [u64; 6] {
+    let (d0, carry) = slc(v[0], pow, 0);
+    let (d1, carry) = slc(v[1], pow, carry);
+    let (d2, carry) = slc(v[2], pow, carry);
+    let (d3, carry) = slc(v[3], pow, carry);
+    let (d4, carry) = slc(v[4], pow, carry);
+    let (d5, _carry) = slc(v[5], pow, carry);
 
-    // Attempt to subtract the modulus, to ensure the value
-    // is smaller than the modulus.
+    if cfg!(debug_assertions) && _carry != 0 {
+        panic!("carry != 0");
+    }
+
     [d0, d1, d2, d3, d4, d5]
 }
 
 #[inline]
-const fn subtract_p<const VARTIME: bool>(v: &[u64; 6], modulus: &[u64; 6]) -> [u64; 6] {
+const fn subtract_p<const VARTIME: bool>(msb: bool, v: &[u64; 6], modulus: &[u64; 6]) -> [u64; 6] {
     let (r0, borrow) = borrowing_sub(v[0], modulus[0], false);
     let (r1, borrow) = borrowing_sub(v[1], modulus[1], borrow);
     let (r2, borrow) = borrowing_sub(v[2], modulus[2], borrow);
@@ -318,13 +106,13 @@ const fn subtract_p<const VARTIME: bool>(v: &[u64; 6], modulus: &[u64; 6]) -> [u
     let (r4, borrow) = borrowing_sub(v[4], modulus[4], borrow);
     let (r5, borrow) = borrowing_sub(v[5], modulus[5], borrow);
 
-    // If underflow occurred on the final limb, borrow = 0xfff...fff, otherwise
-    // borrow = 0x000...000. Thus, we use it as a mask!
     match VARTIME {
-        true if borrow => *v,
+        true if borrow > msb => *v,
         true => [r0, r1, r2, r3, r4, r5],
         false => {
-            let borrow = borrow as u64 * u64::MAX;
+            // If underflow occurred on the final limb, borrow = 0xfff...fff, otherwise
+            // borrow = 0x000...000. Thus, we use it as a mask!
+            let borrow = -(borrow as i64) as u64;
             [
                 (v[0] & borrow) | (r0 & !borrow),
                 (v[1] & borrow) | (r1 & !borrow),
@@ -337,6 +125,253 @@ const fn subtract_p<const VARTIME: bool>(v: &[u64; 6], modulus: &[u64; 6]) -> [u
     }
 }
 
+#[inline]
+const fn montgomery_reduce<const MAGNITUDE: usize, const VARTIME: bool>(lhs: &[u64; 6]) -> [u64; 6] {
+    let mut new = [0; 12];
+    new[0] = lhs[0];
+    new[1] = lhs[1];
+    new[2] = lhs[2];
+    new[3] = lhs[3];
+    new[4] = lhs[4];
+    new[5] = lhs[5];
+    let (mut v, msb) = wide::montgomery_reduce_wide(&new);
+    if MAGNITUDE > 0 {
+        v = subtract_p::<VARTIME>(msb, &v, &MODULUS)
+    }
+    v
+}
+
+// The internal representation of this type is six 64-bit unsigned
+// integers in little-endian order. `Fp` values are always in
+// Montgomery form; i.e., Scalar(a) = aR mod p, with R = 2^384.
+#[derive(Copy, Clone)]
+pub struct Fp<const MAGNITUDE: usize = 0, const VARTIME: bool = false>(pub(crate) [u64; 6]);
+
+impl<const MAGNITUDE: usize, const VARTIME: bool> OtherMag for Fp<MAGNITUDE, VARTIME> {
+    type Mag<const MAG2: usize> = Fp<MAG2, VARTIME>;
+}
+
+impl<const VARTIME: bool> Mag<1, [u64; 6]> for Fp<0, VARTIME> {
+    type Prev = Never;
+    type Next = Fp<1, VARTIME>;
+
+    /// A multiple of the prime that is larger than this element could be (p).
+    const MODULUS: [u64; 6] = MODULUS;
+
+    #[inline(always)]
+    fn make([v]: [[u64; 6]; 1]) -> Self {
+        Self(v)
+    }
+    #[inline(always)]
+    fn data(&self) -> [&[u64; 6]; 1] {
+        [&self.0]
+    }
+    #[inline(always)]
+    fn negate(&self) -> Self {
+        self.neg()
+    }
+}
+
+macro_rules! mag_impl {
+    ($($($ua:literal),+ $(,)?)?) => {$($(
+impl<const VARTIME: bool> Mag<1, [u64; 6]> for Fp<$ua, VARTIME> {
+    type Prev = Fp<{$ua - 1}, VARTIME>;
+    type Next = Fp<{$ua + 1}, VARTIME>;
+
+    /// A multiple of the prime that is larger than this element could be (p).
+    const MODULUS: [u64; 6] = add(&Self::Prev::MODULUS, &MODULUS);
+
+    #[inline(always)]
+    fn make([v]: [[u64; 6]; 1]) -> Self {
+        Self(v)
+    }
+    #[inline(always)]
+    fn data(&self) -> [&[u64; 6]; 1] {
+        [&self.0]
+    }
+    #[inline(always)]
+    fn negate(&self) -> Self {
+        self.neg()
+    }
+}
+
+impl<const VARTIME: bool> NonZero for Fp<$ua, VARTIME> {}
+    )+)?};
+}
+
+mag_impl! {1, 2, 3, 4, 5, 6, 7}
+
+impl<const VARTIME: bool> Mag<1, [u64; 6]> for Fp<8, VARTIME> {
+    type Prev = Fp<7, VARTIME>;
+    type Next = Never;
+
+    /// A multiple of the prime that is larger than this element could be (p).
+    const MODULUS: [u64; 6] = add(&Self::Prev::MODULUS, &MODULUS);
+
+    #[inline(always)]
+    fn make([v]: [[u64; 6]; 1]) -> Self {
+        Self(v)
+    }
+    #[inline(always)]
+    fn data(&self) -> [&[u64; 6]; 1] {
+        [&self.0]
+    }
+    #[inline(always)]
+    fn negate(&self) -> Self {
+        Self::make([negate(self.data()[0], &Self::MODULUS)])
+    }
+}
+impl<const VARTIME: bool> NonZero for Fp<8, VARTIME> {}
+
+impl<const MAG2: usize, const VARTIME: bool> Ops<1, [u64; 6], MAG2> for Fp<0, VARTIME>
+where
+    Fp<MAG2, VARTIME>: Mag<1, [u64; 6]>,
+{
+    type OpOut = <Fp<MAG2, VARTIME> as Mag<1, [u64; 6]>>::Next;
+    #[inline(always)]
+    fn add(lhs: &Self, rhs: &Fp<MAG2, VARTIME>) -> Self::OpOut {
+        Mag::make([add(&lhs.0, &rhs.0)])
+    }
+    #[inline(always)]
+    fn sub(lhs: &Self, rhs: &Fp<MAG2, VARTIME>) -> Self::OpOut {
+        Mag::make([sub::<VARTIME>(&lhs.0, &rhs.0, <Self::OpOut>::MODULUS)])
+    }
+}
+
+impl<const MAG1: usize, const MAG2: usize, const VARTIME: bool> Ops<1, [u64; 6], MAG2> for Fp<MAG1, VARTIME>
+where
+    Fp<MAG1, VARTIME>: Mag<1, [u64; 6]> + NonZero,
+    <Fp<MAG1, VARTIME> as Mag<1, [u64; 6]>>::Prev: Ops<1, [u64; 6], MAG2>,
+    Fp<MAG2, VARTIME>: Mag<1, [u64; 6]>,
+{
+    type OpOut =
+        <<<Fp<MAG1, VARTIME> as Mag<1, [u64; 6]>>::Prev as Ops<1, [u64; 6], MAG2>>::OpOut as Mag<1, [u64; 6]>>::Next;
+    #[inline(always)]
+    fn add(lhs: &Self, rhs: &Self::Mag<MAG2>) -> Self::OpOut
+    where
+        Self::Mag<MAG2>: Mag<1, [u64; 6]>,
+    {
+        Mag::make([add(lhs.data()[0], rhs.data()[0])])
+    }
+    #[inline(always)]
+    fn sub(lhs: &Self, rhs: &Self::Mag<MAG2>) -> Self::OpOut
+    where
+        Self::Mag<MAG2>: Mag<1, [u64; 6]>,
+    {
+        Mag::make([sub::<VARTIME>(&lhs.0, &rhs.data()[0], <Self::OpOut>::MODULUS)])
+    }
+}
+
+macro_rules! impl_double {
+    ($pow:literal: $($($ua:literal),+ $(,)?)?) => {$($(
+impl<const VARTIME: bool> DoubleOp<$pow> for Fp<$ua, VARTIME> {
+    type DoubleOut = Fp<{($ua+1)*(1<<($pow+1))-1}, VARTIME>;
+    fn double(lhs: &Self) -> Self::DoubleOut {
+        Fp(double(&lhs.0, $pow+1))
+    }
+}
+    )+)?};
+}
+
+impl_double!{0: 0, 1, 2, 3}
+impl_double!{1: 0, 1}
+impl_double!{2: 0}
+
+
+impl<const MAGNITUDE: usize, const VARTIME: bool> MontOp for Fp<MAGNITUDE, VARTIME> {
+    type MontOut = [u64; 6];
+    fn montgomery_reduce(lhs: &Self) -> Self::MontOut {
+        montgomery_reduce::<MAGNITUDE, VARTIME>(&lhs.0)
+    }
+}
+
+impl<'a, 'b, const MAG1: usize, const MAG2: usize, const VARTIME: bool> Add<&'b Fp<MAG2, VARTIME>> for &'a Fp<MAG1, VARTIME>
+where
+    Fp<MAG1, VARTIME>: NonZero + Ops<1, [u64; 6], MAG2>,
+    <Fp<MAG1, VARTIME> as OtherMag>::Mag<MAG2>: Mag<1, [u64; 6]>,
+    for<'j> &'j Fp<MAG2, VARTIME>: Into<&'j <Fp<MAG1, VARTIME> as OtherMag>::Mag<MAG2>>,
+{
+    type Output = <Fp<MAG1, VARTIME> as Ops<1, [u64; 6], MAG2>>::OpOut;
+
+    #[inline(always)]
+    fn add(self, rhs: &'b Fp<MAG2, VARTIME>) -> Self::Output {
+        Ops::add(self, rhs.into())
+    }
+}
+impl<'a, 'b, const MAG1: usize, const MAG2: usize, const VARTIME: bool> Sub<&'b Fp<MAG2, VARTIME>> for &'a Fp<MAG1, VARTIME>
+where
+    Fp<MAG1, VARTIME>: NonZero + Ops<1, [u64; 6], MAG2>,
+    <Fp<MAG1, VARTIME> as OtherMag>::Mag<MAG2>: Mag<1, [u64; 6]>,
+    for<'j> &'j Fp<MAG2, VARTIME>: Into<&'j <Fp<MAG1, VARTIME> as OtherMag>::Mag<MAG2>>,
+{
+    type Output = <Fp<MAG1, VARTIME> as Ops<1, [u64; 6], MAG2>>::OpOut;
+
+    #[inline(always)]
+    fn sub(self, rhs: &'b Fp<MAG2, VARTIME>) -> Self::Output {
+        Ops::sub(self, rhs.into())
+    }
+}
+impl_binops_additive_output! {
+{const MAG1: usize, const MAG2: usize, const VARTIME: bool}
+{where Fp<MAG1, VARTIME>: NonZero+Ops<1, [u64; 6], MAG2>, <Fp<MAG1, VARTIME> as OtherMag>::Mag<MAG2>: Mag<1, [u64; 6]>, for<'j> &'j Fp<MAG2, VARTIME>: Into<&'j <Fp<MAG1, VARTIME> as OtherMag>::Mag<MAG2>>}
+{Fp<MAG1, VARTIME>}
+{Fp<MAG2, VARTIME>}}
+
+impl<const MAGNITUDE: usize, const VARTIME: bool> fmt::Debug for Fp<MAGNITUDE, VARTIME> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let tmp = self.to_bytes();
+        write!(f, "0x")?;
+        for &b in tmp.iter() {
+            write!(f, "{:02x}", b)?;
+        }
+        Ok(())
+    }
+}
+
+impl<const MAGNITUDE: usize, const VARTIME: bool> Default for Fp<MAGNITUDE, VARTIME> {
+    fn default() -> Self {
+        Self::zero()
+    }
+}
+
+#[cfg(feature = "zeroize")]
+impl<const MAGNITUDE: usize, const VARTIME: bool> zeroize::DefaultIsZeroes for Fp<MAGNITUDE, VARTIME> {}
+
+impl<const MAGNITUDE: usize, const VARTIME: bool> ConstantTimeEq for Fp<MAGNITUDE, VARTIME> {
+    fn ct_eq(&self, other: &Self) -> Choice {
+        self.0[0].ct_eq(&other.0[0])
+            & self.0[1].ct_eq(&other.0[1])
+            & self.0[2].ct_eq(&other.0[2])
+            & self.0[3].ct_eq(&other.0[3])
+            & self.0[4].ct_eq(&other.0[4])
+            & self.0[5].ct_eq(&other.0[5])
+    }
+}
+
+impl<const MAGNITUDE: usize, const VARTIME: bool> Eq for Fp<MAGNITUDE, VARTIME> {}
+impl<const MAGNITUDE: usize, const VARTIME: bool> PartialEq for Fp<MAGNITUDE, VARTIME> {
+    fn eq(&self, other: &Self) -> bool {
+        match VARTIME {
+            true => self.0 == other.0,
+            false => bool::from(self.ct_eq(other)),
+        }
+    }
+}
+
+impl<const MAGNITUDE: usize, const VARTIME: bool> ConditionallySelectable for Fp<MAGNITUDE, VARTIME> {
+    fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
+        Fp([
+            u64::conditional_select(&a.0[0], &b.0[0], choice),
+            u64::conditional_select(&a.0[1], &b.0[1], choice),
+            u64::conditional_select(&a.0[2], &b.0[2], choice),
+            u64::conditional_select(&a.0[3], &b.0[3], choice),
+            u64::conditional_select(&a.0[4], &b.0[4], choice),
+            u64::conditional_select(&a.0[5], &b.0[5], choice),
+        ])
+    }
+}
+
+
 /// p = 4002409555221667393417789825735904156556882819939007885332058136124031650490837864442687629129015664037894272559787
 const MODULUS: [u64; 6] = [
     0xb9fe_ffff_ffff_aaab,
@@ -347,9 +382,22 @@ const MODULUS: [u64; 6] = [
     0x1a01_11ea_397f_e69a,
 ];
 
-const P2: [u64; 6] = double(&MODULUS);
-const P4: [u64; 6] = double(&P2);
-const P8: [u64; 6] = double(&P4);
+const MODS: [[u64;6]; 9] = [
+    <Fp<0, false> as Mag<1, _>>::MODULUS,
+    <Fp<1, false> as Mag<1, _>>::MODULUS,
+    <Fp<2, false> as Mag<1, _>>::MODULUS,
+    <Fp<3, false> as Mag<1, _>>::MODULUS,
+    <Fp<4, false> as Mag<1, _>>::MODULUS,
+    <Fp<5, false> as Mag<1, _>>::MODULUS,
+    <Fp<6, false> as Mag<1, _>>::MODULUS,
+    <Fp<7, false> as Mag<1, _>>::MODULUS,
+    <Fp<8, false> as Mag<1, _>>::MODULUS,
+];
+
+const P2: [u64; 6] = double(&MODULUS, 1);
+const P4: [u64; 6] = double(&P2, 1);
+const P5: [u64; 6] = add(&P4, &MODULUS);
+const P8: [u64; 6] = double(&P4, 1);
 
 /// INV = -(p^{-1} mod 2^64) mod 2^64
 const INV: u64 = 0x89f3_fffc_fffc_fffd;
@@ -384,66 +432,86 @@ const R3: Fp = Fp([
     0x0aa6_3460_9175_5d4d,
 ]);
 
-impl<'a> Neg for &'a Fp {
-    type Output = Fp;
+impl<'a, const MAGNITUDE: usize, const VARTIME: bool> Neg for &'a Fp<MAGNITUDE, VARTIME>
+where Fp<MAGNITUDE, VARTIME>: Mag<1, [u64; 6]> {
+    type Output = Fp<MAGNITUDE, VARTIME>;
 
     #[inline]
-    fn neg(self) -> Fp {
-        self.neg::<false>()
+    fn neg(self) -> Fp<MAGNITUDE, VARTIME> {
+        self.negate()
     }
 }
 
-impl Neg for Fp {
-    type Output = Fp;
+impl<const MAGNITUDE: usize, const VARTIME: bool> Neg for Fp<MAGNITUDE, VARTIME>
+where Fp<MAGNITUDE, VARTIME>: Mag<1, [u64; 6]> {
+    type Output = Self;
 
     #[inline]
-    fn neg(self) -> Fp {
+    fn neg(self) -> Self {
         -&self
     }
 }
 
-impl<'a, 'b> Sub<&'b Fp> for &'a Fp {
-    type Output = Fp;
+impl<'a, 'b, const VARTIME: bool> Sub<&'b Fp<0, VARTIME>> for &'a Fp<0, VARTIME> {
+    type Output = Fp<0, VARTIME>;
 
     #[inline]
-    fn sub(self, rhs: &'b Fp) -> Fp {
-        self.sub::<false>(rhs)
+    fn sub(self, rhs: &'b Fp<0, VARTIME>) -> Fp<0, VARTIME> {
+        self.sub(rhs)
     }
 }
 
-impl<'a, 'b> Add<&'b Fp> for &'a Fp {
-    type Output = Fp;
+impl<'a, 'b, const VARTIME: bool> Add<&'b Fp<0, VARTIME>> for &'a Fp<0, VARTIME> {
+    type Output = Fp<0, VARTIME>;
 
     #[inline]
-    fn add(self, rhs: &'b Fp) -> Fp {
-        self.add::<false>(rhs)
+    fn add(self, rhs: &'b Fp<0, VARTIME>) -> Fp<0, VARTIME> {
+        self.add(rhs)
     }
 }
 
-impl<'a, 'b> Mul<&'b Fp> for &'a Fp {
-    type Output = Fp;
+impl<'a, 'b, const VARTIME: bool> Mul<&'b Fp<0, VARTIME>> for &'a Fp<0, VARTIME> {
+    type Output = Fp<0, VARTIME>;
 
     #[inline]
-    fn mul(self, rhs: &'b Fp) -> Fp {
-        self.mul::<false>(rhs)
+    fn mul(self, rhs: &'b Fp<0, VARTIME>) -> Fp<0, VARTIME> {
+        self.mul(rhs)
     }
 }
 
-impl_binops_additive!(Fp, Fp);
-impl_binops_multiplicative!(Fp, Fp);
+impl_binops_additive!{
+    {const VARTIME: bool}
+    {}
+    {Fp<0, VARTIME>}
+    {Fp<0, VARTIME>}
+}
+impl_binops_multiplicative!{
+    {const VARTIME: bool}
+    {}
+    {Fp<0, VARTIME>}
+    {Fp<0, VARTIME>}
+}
 
-impl<const MAGNITUDE: usize> Fp<MAGNITUDE> {
+impl<const MAGNITUDE: usize, const VARTIME: bool> Fp<MAGNITUDE, VARTIME> {
     /// Returns zero, the additive identity.
     #[inline]
     pub const fn zero() -> Self {
         Self([0, 0, 0, 0, 0, 0])
     }
+
     /// Returns one, the multiplicative identity.
     #[inline]
     pub const fn one() -> Self {
         Self(R.0)
     }
 
+    /// Returns one, the multiplicative identity.
+    #[inline]
+    pub const fn vartime<const VARTIME2: bool>(self) -> Fp<MAGNITUDE, VARTIME2> {
+        Fp(self.0)
+    }
+
+    #[inline]
     pub const fn eq_vartime(&self, rhs: &Self) -> bool {
         self.0[0] == rhs.0[0]
             && self.0[1] == rhs.0[1]
@@ -459,7 +527,7 @@ impl<const MAGNITUDE: usize> Fp<MAGNITUDE> {
     }
 
     #[inline]
-    pub fn is_zero_vartime(&self) -> bool {
+    pub const fn is_zero_vartime(&self) -> bool {
         self.eq_vartime(&Fp::zero())
     }
 
@@ -471,30 +539,43 @@ impl<const MAGNITUDE: usize> Fp<MAGNITUDE> {
     }
 
     /// Constructs an element of `Fp` ensuring that it is canonical.
-    pub const fn from_raw(v: [u64; 6]) -> Self {
+    pub const fn from_raw(mut v: [u64; 6]) -> Self {
         // Attempt to subtract all possible multiples of the modulus, to ensure
         // the value is smaller than the modulus.
-        let v = subtract_p::<false>(&v, &P8);
-        let v = subtract_p::<false>(&v, &P4);
-        let v = subtract_p::<false>(&v, &P2);
-        let v = subtract_p::<false>(&v, &MODULUS);
+        match MAGNITUDE {
+            0 => {
+                v = subtract_p::<VARTIME>(false, &v, &MODS[5]);
+                v = subtract_p::<VARTIME>(false, &v, &MODS[2]);
+                v = subtract_p::<VARTIME>(false, &v, &MODS[1]);
+                v = subtract_p::<VARTIME>(false, &v, &MODS[0]);
+            },
+            1 => {
+                v = subtract_p::<VARTIME>(false, &v, &MODS[5]);
+                v = subtract_p::<VARTIME>(false, &v, &MODS[2]);
+                v = subtract_p::<VARTIME>(false, &v, &MODS[1]);
+            },
+            2 => {
+                v = subtract_p::<VARTIME>(false, &v, &MODS[5]);
+                v = subtract_p::<VARTIME>(false, &v, &MODS[2]);
+            },
+            3 => {
+                v = subtract_p::<VARTIME>(false, &v, &MODS[5]);
+                v = subtract_p::<VARTIME>(false, &v, &MODS[3]);
+            },
+            4 => {
+                v = subtract_p::<VARTIME>(false, &v, &MODS[5]);
+                v = subtract_p::<VARTIME>(false, &v, &MODS[4]);
+            },
+            mag => {
+                v = subtract_p::<VARTIME>(false, &v, &MODS[mag]);
+            },
+        }
         Self(v)
     }
 
     #[inline(always)]
-    pub(crate) fn montgomery_reduce(&self) -> [u64; 6] {
-        let mut new = [0; 12];
-        new[0] = self.0[0];
-        new[1] = self.0[1];
-        new[2] = self.0[2];
-        new[3] = self.0[3];
-        new[4] = self.0[4];
-        new[5] = self.0[5];
-        let mut v = wide::montgomery_reduce_wide(&new);
-        if MAGNITUDE > 0 {
-            v = subtract_p::<false>(&v, &MODULUS)
-        }
-        v
+    pub(crate) const fn montgomery_reduce(&self) -> [u64; 6] {
+        montgomery_reduce::<MAGNITUDE, VARTIME>(&self.0)
     }
 
     /// Converts an element of `Fp` into a byte representation in
@@ -515,32 +596,295 @@ impl<const MAGNITUDE: usize> Fp<MAGNITUDE> {
         res
     }
 
-    pub fn reduce<const VARTIME: bool>(self) -> Fp
-    where
-        Self: NonZero,
-    {
+    /// Reduce the magnitude of an `Fp` to `0`
+    pub const fn reduce_full(self) -> Fp<0, VARTIME> {
         let mut v = self.0;
         if MAGNITUDE >= 8 {
-            v = subtract_p::<VARTIME>(&v, &P8)
+            v = subtract_p::<VARTIME>(false, &v, &P8)
         }
         if MAGNITUDE >= 4 {
-            v = subtract_p::<VARTIME>(&v, &P4)
+            v = subtract_p::<VARTIME>(false, &v, &P4)
         }
         if MAGNITUDE >= 2 {
-            v = subtract_p::<VARTIME>(&v, &P2)
+            v = subtract_p::<VARTIME>(false, &v, &P2)
         }
         if MAGNITUDE >= 1 {
-            v = subtract_p::<VARTIME>(&v, &MODULUS)
+            v = subtract_p::<VARTIME>(false, &v, &MODULUS)
         }
         Fp(v)
     }
+
+    #[inline]
+    pub const fn neg(&self) -> Self {
+        match VARTIME {
+            true if self.is_zero_vartime() => *self,
+            true => Self(negate(&self.0, &MODS[MAGNITUDE])),
+            false => {
+                // Let's use a mask if `self` was zero, which would mean
+                // the result of the subtraction is p.
+                let mask = (((self.0[0] | self.0[1] | self.0[2] | self.0[3] | self.0[4] | self.0[5]) == 0)
+                as u64)
+                .wrapping_sub(1);
+
+                let v = negate(&self.0, &MODS[MAGNITUDE]);
+                Self([
+                    v[0] & mask,
+                    v[1] & mask,
+                    v[2] & mask,
+                    v[3] & mask,
+                    v[4] & mask,
+                    v[5] & mask,
+                ])
+            }
+        }
+    }
+
+    /// Squares this element.
+    #[inline]
+    pub const fn square(&self) -> Self {
+        let mut v = montgomery_reduce_wide(&square_wide(&self.0)).0;
+        
+        // $Solve[b=((m*p)^2 + R*p − p) / (R*p) && m == 1 && R==2^384 && p==4002409555221667393417789825735904156556882819939007885332058136124031650490837864442687629129015664037894272559787, b]$
+        // We can see that `montgomery_reduce_wide` will produce results with an upper bound of $p + 0.1015788266026898895 * m^2*p$
+        // This means we actually only have to reduce the item in two cases
+        match MAGNITUDE {
+            0 => v = subtract_p::<VARTIME>(false, &v, &<Fp<0, false> as Mag<1, _>>::MODULUS),
+            8 => v = subtract_p::<VARTIME>(false, &v, &<Fp<8, false> as Mag<1, _>>::MODULUS),
+            _ => {},
+        }
+        Self(v)
+    }
+
+    /// Squares this element.
+    #[inline]
+    pub const fn mul(&self, rhs: &Fp<MAGNITUDE, VARTIME>) -> Self {
+        let mut v = montgomery_reduce_wide(&mul_wide(&self.0, &rhs.0)).0;
+        
+        // $Solve[b=((m*p)^2 + R*p − p) / (R*p) && m == 1 && R==2^384 && p==4002409555221667393417789825735904156556882819939007885332058136124031650490837864442687629129015664037894272559787, b]$
+        // We can see that `montgomery_reduce_wide` will produce results with an upper bound of $p + 0.1015788266026898895 * m^2*p$
+        // This means we actually only have to reduce the item in two cases
+        match MAGNITUDE {
+            0 => v = subtract_p::<VARTIME>(false, &v, &<Fp<0, false> as Mag<1, _>>::MODULUS),
+            8 => v = subtract_p::<VARTIME>(false, &v, &<Fp<8, false> as Mag<1, _>>::MODULUS),
+            _ => {},
+        }
+        Self(v)
+    }
+
+    #[inline]
+    pub const fn add(&self, rhs: &Self) -> Self {
+        // Attempt to subtract the modulus, to ensure the value
+        // is smaller than the modulus.
+        Fp(subtract_p::<VARTIME>(false, &add(&self.0, &rhs.0), &MODS[MAGNITUDE]))
+    }
+
+    #[inline]
+    pub const fn double(&self) -> Self {
+        // Attempt to subtract the modulus, to ensure the value
+        // is smaller than the modulus.
+        Fp(subtract_p::<VARTIME>(false, &double(&self.0, 1), &MODS[MAGNITUDE]))
+    }
+
+    #[inline]
+    pub const fn sub(&self, rhs: &Self) -> Self {
+        Fp(sub::<VARTIME>(&self.0, &rhs.0, MODS[MAGNITUDE]))
+    }
+
+    /// Although this is labeled "vartime", it is only
+    /// variable time with respect to the exponent. It
+    /// is also not exposed in the public API.
+    pub const fn pow_vartime(&self, by: &[u64; 6]) -> Self {
+        if MAGNITUDE == 0 {
+            return Fp(Fp::<1>(self.0).pow_vartime(by).reduce_full().0);
+        }
+        let mut res = Self::one();
+        // for e in by.iter().rev() {
+        let mut e_i = by.len();
+        while e_i > 0 {
+            e_i -= 1;
+            let e = &by[e_i];
+            // for i in (0..64).rev() {
+            let mut i = 64;
+            while i > 0 {
+                i -= 1;
+                res = res.square();
+
+                if ((*e >> i) & 1) == 1 {
+                    res = res.mul(self);
+                }
+            }
+        }
+        res
+    }
+
+    /// Returns `c = a.zip(b).fold(0, |acc, (a_i, b_i)| acc + a_i * b_i)`.
+    ///
+    /// Implements Algorithm 2 from Patrick Longa's
+    /// [ePrint 2022-367](https://eprint.iacr.org/2022/367) §3.
+    #[inline]
+    pub(crate) const fn sum_of_products<const T: usize>(a: [Self; T], b: [Self; T]) -> Self {
+        // For a single `a x b` multiplication, operand scanning (schoolbook) takes each
+        // limb of `a` in turn, and multiplies it by all of the limbs of `b` to compute
+        // the result as a double-width intermediate representation, which is then fully
+        // reduced at the end. Here however we have pairs of multiplications (a_i, b_i),
+        // the results of which are summed.
+        //
+        // The intuition for this algorithm is two-fold:
+        // - We can interleave the operand scanning for each pair, by processing the jth
+        //   limb of each `a_i` together. As these have the same offset within the overall
+        //   operand scanning flow, their results can be summed directly.
+        // - We can interleave the multiplication and reduction steps, resulting in a
+        //   single bitshift by the limb size after each iteration. This means we only
+        //   need to store a single extra limb overall, instead of keeping around all the
+        //   intermediate results and eventually having twice as many limbs.
+
+        // Algorithm 2, line 2
+        let (mut u0, mut u1, mut u2, mut u3, mut u4, mut u5) = (0, 0, 0, 0, 0, 0);
+        let mut j = 0;
+        while j < 6 {
+            let (mut t0, mut t1, mut t2, mut t3, mut t4, mut t5, mut t6) = (u0, u1, u2, u3, u4, u5, 0);
+            let mut i = 0;
+            // For each pair in the overall sum of products:
+            while i < T {
+                // Compute digit_j x row and accumulate into `u`.
+                let mut carry;
+                (t0, carry) = mac(t0, a[i].0[j], b[i].0[0], 0);
+                (t1, carry) = mac(t1, a[i].0[j], b[i].0[1], carry);
+                (t2, carry) = mac(t2, a[i].0[j], b[i].0[2], carry);
+                (t3, carry) = mac(t3, a[i].0[j], b[i].0[3], carry);
+                (t4, carry) = mac(t4, a[i].0[j], b[i].0[4], carry);
+                (t5, carry) = mac(t5, a[i].0[j], b[i].0[5], carry);
+                (t6, _) = adc(t6, 0, carry);
+
+                i += 1;
+            }
+
+            // Algorithm 2, lines 4-5
+            // This is a single step of the usual Montgomery reduction process.
+            let k = t0.wrapping_mul(INV);
+            let (_, carry) = mac(t0, k, MODULUS[0], 0);
+            let (r1, carry) = mac(t1, k, MODULUS[1], carry);
+            let (r2, carry) = mac(t2, k, MODULUS[2], carry);
+            let (r3, carry) = mac(t3, k, MODULUS[3], carry);
+            let (r4, carry) = mac(t4, k, MODULUS[4], carry);
+            let (r5, carry) = mac(t5, k, MODULUS[5], carry);
+            let (r6, _) = adc(t6, 0, carry);
+
+            (u0, u1, u2, u3, u4, u5) = (r1, r2, r3, r4, r5, r6);
+            j += 1;
+        }
+
+        // let (u0, u1, u2, u3, u4, u5) =
+        //     (0..6).fold((0, 0, 0, 0, 0, 0), |(u0, u1, u2, u3, u4, u5), j| {
+        //         // Algorithm 2, line 3
+        //         // For each pair in the overall sum of products:
+        //         let (t0, t1, t2, t3, t4, t5, t6) = (0..T).fold(
+        //             (u0, u1, u2, u3, u4, u5, 0),
+        //             |(t0, t1, t2, t3, t4, t5, t6), i| {
+        //                 // Compute digit_j x row and accumulate into `u`.
+        //                 let (t0, carry) = mac(t0, a[i].0[j], b[i].0[0], 0);
+        //                 let (t1, carry) = mac(t1, a[i].0[j], b[i].0[1], carry);
+        //                 let (t2, carry) = mac(t2, a[i].0[j], b[i].0[2], carry);
+        //                 let (t3, carry) = mac(t3, a[i].0[j], b[i].0[3], carry);
+        //                 let (t4, carry) = mac(t4, a[i].0[j], b[i].0[4], carry);
+        //                 let (t5, carry) = mac(t5, a[i].0[j], b[i].0[5], carry);
+        //                 let (t6, _) = adc(t6, 0, carry);
+
+        //                 (t0, t1, t2, t3, t4, t5, t6)
+        //             },
+        //         );
+
+        //         // Algorithm 2, lines 4-5
+        //         // This is a single step of the usual Montgomery reduction process.
+        //         let k = t0.wrapping_mul(INV);
+        //         let (_, carry) = mac(t0, k, MODULUS[0], 0);
+        //         let (r1, carry) = mac(t1, k, MODULUS[1], carry);
+        //         let (r2, carry) = mac(t2, k, MODULUS[2], carry);
+        //         let (r3, carry) = mac(t3, k, MODULUS[3], carry);
+        //         let (r4, carry) = mac(t4, k, MODULUS[4], carry);
+        //         let (r5, carry) = mac(t5, k, MODULUS[5], carry);
+        //         let (r6, _) = adc(t6, 0, carry);
+
+        //         (r1, r2, r3, r4, r5, r6)
+        //     });
+
+        // Because we represent F_p elements in non-redundant form, we need a final
+        // conditional subtraction to ensure the output is in range.
+        Fp(subtract_p::<VARTIME>(false, &[u0, u1, u2, u3, u4, u5], &MODS[MAGNITUDE]))
+    }
+
+    /// Exponentiate by p - 2
+    #[inline]
+    fn try_invert(&self) -> Self {
+        self.pow_vartime(&[
+            0xb9fe_ffff_ffff_aaa9,
+            0x1eab_fffe_b153_ffff,
+            0x6730_d2a0_f6b0_f624,
+            0x6477_4b84_f385_12bf,
+            0x4b1b_a7b6_434b_acd7,
+            0x1a01_11ea_397f_e69a,
+        ])
+    }
+
+    /// Computes the multiplicative inverse of this field
+    /// element, returning None in the case that this element
+    /// is zero.
+    #[inline]
+    pub fn invert(&self) -> CtOption<Self> {
+        let t = self.try_invert();
+        CtOption::new(t, !self.is_zero())
+    }
+
+    /// Computes the multiplicative inverse of this field
+    /// element, returning None in the case that this element
+    /// is zero.
+    #[inline]
+    pub fn invert_vartime(&self) -> Option<Self> {
+        if self.is_zero_vartime() {
+            None
+        } else {
+            Some(self.try_invert())
+        }
+    }
+
+    // We use Shank's method, as p = 3 (mod 4). This means
+    // we only need to exponentiate by (p+1)/4. This only
+    // works for elements that are actually quadratic residue,
+    // so we check that we got the correct result at the end.
+    #[inline]
+    fn try_sqrt(&self) -> Self {
+        self.pow_vartime(&[
+            0xee7f_bfff_ffff_eaab,
+            0x07aa_ffff_ac54_ffff,
+            0xd9cc_34a8_3dac_3d89,
+            0xd91d_d2e1_3ce1_44af,
+            0x92c6_e9ed_90d2_eb35,
+            0x0680_447a_8e5f_f9a6,
+        ])
+    }
+
+    #[inline]
+    pub fn sqrt(&self) -> CtOption<Self> {
+        let sqrt = self.try_sqrt();
+        CtOption::new(sqrt, sqrt.square().ct_eq(self))
+    }
+
+    #[inline]
+    pub fn sqrt_vartime(&self) -> Option<Self> {
+        let sqrt = self.try_sqrt();
+        if sqrt.square().eq_vartime(self) {
+            Some(sqrt)
+        } else {
+            None
+        }
+    }
 }
 
-impl Fp {
+impl<const VARTIME: bool> Fp<0, VARTIME> {
     /// Attempts to convert a big-endian byte representation of
     /// a scalar into an `Fp`, failing if the input is not canonical.
-    pub fn from_bytes(bytes: &[u8; 48]) -> CtOption<Fp> {
-        let mut tmp = Fp([0, 0, 0, 0, 0, 0]);
+    pub fn from_bytes(bytes: &[u8; 48]) -> CtOption<Self> {
+        let mut tmp = Self([0, 0, 0, 0, 0, 0]);
 
         tmp.0[5] = u64::from_be_bytes(<[u8; 8]>::try_from(&bytes[0..8]).unwrap());
         tmp.0[4] = u64::from_be_bytes(<[u8; 8]>::try_from(&bytes[8..16]).unwrap());
@@ -564,17 +908,17 @@ impl Fp {
 
         // Convert to Montgomery form by computing
         // (a.R^0 * R^2) / R = a.R
-        tmp *= &R2;
+        tmp = tmp.mul(&Fp(R2.0));
 
         CtOption::new(tmp, Choice::from(is_some))
     }
 
-    pub(crate) fn random(mut rng: impl RngCore) -> Fp {
+    pub fn random(mut rng: impl RngCore) -> Self {
         let mut bytes = [0u8; 96];
         rng.fill_bytes(&mut bytes);
 
         // Parse the random bytes as a big-endian number, to match Fp encoding order.
-        Fp::from_u768([
+        Self::from_u768([
             u64::from_be_bytes(<[u8; 8]>::try_from(&bytes[0..8]).unwrap()),
             u64::from_be_bytes(<[u8; 8]>::try_from(&bytes[8..16]).unwrap()),
             u64::from_be_bytes(<[u8; 8]>::try_from(&bytes[16..24]).unwrap()),
@@ -591,7 +935,7 @@ impl Fp {
     }
 
     /// Reduces a big-endian 64-bit limb representation of a 768-bit number.
-    fn from_u768(limbs: [u64; 12]) -> Fp {
+    fn from_u768(limbs: [u64; 12]) -> Self {
         // We reduce an arbitrary 768-bit number by decomposing it into two 384-bit digits
         // with the higher bits multiplied by 2^384. Thus, we perform two reductions
         //
@@ -605,10 +949,10 @@ impl Fp {
         // that (2^384 - 1)*c is an acceptable product for the reduction. Therefore, the
         // reduction always works so long as `c` is in the field; in this case it is either the
         // constant `R2` or `R3`.
-        let d1 = Fp([limbs[11], limbs[10], limbs[9], limbs[8], limbs[7], limbs[6]]);
-        let d0 = Fp([limbs[5], limbs[4], limbs[3], limbs[2], limbs[1], limbs[0]]);
+        let d1 = Self([limbs[11], limbs[10], limbs[9], limbs[8], limbs[7], limbs[6]]);
+        let d0 = Self([limbs[5], limbs[4], limbs[3], limbs[2], limbs[1], limbs[0]]);
         // Convert to Montgomery form
-        d0 * R2 + d1 * R3
+        (d0.mul_unreduced(&Fp(R2.0)) + d1.mul_unreduced(&Fp(R3.0))).montgomery_reduce().reduce_full()
     }
 
     /// Returns whether or not this element is strictly lexicographically
@@ -638,209 +982,9 @@ impl Fp {
         !Choice::from(borrow as u8)
     }
 
-    /// Although this is labeled "vartime", it is only
-    /// variable time with respect to the exponent. It
-    /// is also not exposed in the public API.
-    pub fn pow_vartime(&self, by: &[u64; 6]) -> Self {
-        let mut res = Self::one();
-        for e in by.iter().rev() {
-            for i in (0..64).rev() {
-                res = res.square::<true>();
-
-                if ((*e >> i) & 1) == 1 {
-                    res *= self;
-                }
-            }
-        }
-        res
-    }
-
     #[inline]
-    pub fn sqrt(&self) -> CtOption<Self> {
-        // We use Shank's method, as p = 3 (mod 4). This means
-        // we only need to exponentiate by (p+1)/4. This only
-        // works for elements that are actually quadratic residue,
-        // so we check that we got the correct result at the end.
-
-        let sqrt = self.pow_vartime(&[
-            0xee7f_bfff_ffff_eaab,
-            0x07aa_ffff_ac54_ffff,
-            0xd9cc_34a8_3dac_3d89,
-            0xd91d_d2e1_3ce1_44af,
-            0x92c6_e9ed_90d2_eb35,
-            0x0680_447a_8e5f_f9a6,
-        ]);
-
-        CtOption::new(sqrt, sqrt.square::<false>().ct_eq(self))
-    }
-
-    #[inline]
-    /// Computes the multiplicative inverse of this field
-    /// element, returning None in the case that this element
-    /// is zero.
-    pub fn invert(&self) -> CtOption<Self> {
-        // Exponentiate by p - 2
-        let t = self.pow_vartime(&[
-            0xb9fe_ffff_ffff_aaa9,
-            0x1eab_fffe_b153_ffff,
-            0x6730_d2a0_f6b0_f624,
-            0x6477_4b84_f385_12bf,
-            0x4b1b_a7b6_434b_acd7,
-            0x1a01_11ea_397f_e69a,
-        ]);
-
-        CtOption::new(t, !self.is_zero())
-    }
-
-    #[inline]
-    const fn add_helper(&self, rhs: &Fp) -> [u64; 6] {
-        let (d0, carry) = adc(self.0[0], rhs.0[0], 0);
-        let (d1, carry) = adc(self.0[1], rhs.0[1], carry);
-        let (d2, carry) = adc(self.0[2], rhs.0[2], carry);
-        let (d3, carry) = adc(self.0[3], rhs.0[3], carry);
-        let (d4, carry) = adc(self.0[4], rhs.0[4], carry);
-        let (d5, _) = adc(self.0[5], rhs.0[5], carry);
-
-        [d0, d1, d2, d3, d4, d5]
-    }
-
-    #[inline]
-    pub const fn add<const VARTIME: bool>(&self, rhs: &Fp) -> Fp {
-        // Attempt to subtract the modulus, to ensure the value
-        // is smaller than the modulus.
-        Fp(subtract_p::<VARTIME>(&self.add_helper(rhs), &MODULUS))
-    }
-
-    #[inline]
-    const fn neg_helper(&self) -> [u64; 6] {
-        let (d0, borrow) = borrowing_sub(MODULUS[0], self.0[0], false);
-        let (d1, borrow) = borrowing_sub(MODULUS[1], self.0[1], borrow);
-        let (d2, borrow) = borrowing_sub(MODULUS[2], self.0[2], borrow);
-        let (d3, borrow) = borrowing_sub(MODULUS[3], self.0[3], borrow);
-        let (d4, borrow) = borrowing_sub(MODULUS[4], self.0[4], borrow);
-        let (d5, _) = borrowing_sub(MODULUS[5], self.0[5], borrow);
-        [d0, d1, d2, d3, d4, d5]
-    }
-
-    #[inline]
-    pub const fn neg<const VARTIME: bool>(&self) -> Fp {
-        if VARTIME {
-            if self.eq_vartime(&Fp::zero()) {
-                *self
-            } else {
-                Fp(self.neg_helper())
-            }
-        } else {
-            // Let's use a mask if `self` was zero, which would mean
-            // the result of the subtraction is p.
-            let mask = (((self.0[0] | self.0[1] | self.0[2] | self.0[3] | self.0[4] | self.0[5]) == 0)
-                as u64)
-                .wrapping_sub(1);
-    
-            let v = self.neg_helper();
-            Fp([
-                v[0] & mask,
-                v[1] & mask,
-                v[2] & mask,
-                v[3] & mask,
-                v[4] & mask,
-                v[5] & mask,
-            ])
-
-        }
-    }
-
-    #[inline]
-    pub const fn double<const VARTIME: bool>(&self) -> Fp {
-        // Attempt to subtract the modulus, to ensure the value
-        // is smaller than the modulus.
-        Fp(subtract_p::<VARTIME>(&double(&self.0), &MODULUS))
-    }
-
-    #[inline]
-    pub const fn sub<const VARTIME: bool>(&self, rhs: &Fp) -> Fp {
-        (&rhs.neg::<VARTIME>()).add::<VARTIME>(self)
-    }
-
-    /// Returns `c = a.zip(b).fold(0, |acc, (a_i, b_i)| acc + a_i * b_i)`.
-    ///
-    /// Implements Algorithm 2 from Patrick Longa's
-    /// [ePrint 2022-367](https://eprint.iacr.org/2022/367) §3.
-    #[inline]
-    pub(crate) fn sum_of_products<const T: usize, const VARTIME: bool>(a: [Fp; T], b: [Fp; T]) -> Fp {
-        // For a single `a x b` multiplication, operand scanning (schoolbook) takes each
-        // limb of `a` in turn, and multiplies it by all of the limbs of `b` to compute
-        // the result as a double-width intermediate representation, which is then fully
-        // reduced at the end. Here however we have pairs of multiplications (a_i, b_i),
-        // the results of which are summed.
-        //
-        // The intuition for this algorithm is two-fold:
-        // - We can interleave the operand scanning for each pair, by processing the jth
-        //   limb of each `a_i` together. As these have the same offset within the overall
-        //   operand scanning flow, their results can be summed directly.
-        // - We can interleave the multiplication and reduction steps, resulting in a
-        //   single bitshift by the limb size after each iteration. This means we only
-        //   need to store a single extra limb overall, instead of keeping around all the
-        //   intermediate results and eventually having twice as many limbs.
-
-        // Algorithm 2, line 2
-        let (u0, u1, u2, u3, u4, u5) =
-            (0..6).fold((0, 0, 0, 0, 0, 0), |(u0, u1, u2, u3, u4, u5), j| {
-                // Algorithm 2, line 3
-                // For each pair in the overall sum of products:
-                let (t0, t1, t2, t3, t4, t5, t6) = (0..T).fold(
-                    (u0, u1, u2, u3, u4, u5, 0),
-                    |(t0, t1, t2, t3, t4, t5, t6), i| {
-                        // Compute digit_j x row and accumulate into `u`.
-                        let (t0, carry) = mac(t0, a[i].0[j], b[i].0[0], 0);
-                        let (t1, carry) = mac(t1, a[i].0[j], b[i].0[1], carry);
-                        let (t2, carry) = mac(t2, a[i].0[j], b[i].0[2], carry);
-                        let (t3, carry) = mac(t3, a[i].0[j], b[i].0[3], carry);
-                        let (t4, carry) = mac(t4, a[i].0[j], b[i].0[4], carry);
-                        let (t5, carry) = mac(t5, a[i].0[j], b[i].0[5], carry);
-                        let (t6, _) = adc(t6, 0, carry);
-
-                        (t0, t1, t2, t3, t4, t5, t6)
-                    },
-                );
-
-                // Algorithm 2, lines 4-5
-                // This is a single step of the usual Montgomery reduction process.
-                let k = t0.wrapping_mul(INV);
-                let (_, carry) = mac(t0, k, MODULUS[0], 0);
-                let (r1, carry) = mac(t1, k, MODULUS[1], carry);
-                let (r2, carry) = mac(t2, k, MODULUS[2], carry);
-                let (r3, carry) = mac(t3, k, MODULUS[3], carry);
-                let (r4, carry) = mac(t4, k, MODULUS[4], carry);
-                let (r5, carry) = mac(t5, k, MODULUS[5], carry);
-                let (r6, _) = adc(t6, 0, carry);
-
-                (r1, r2, r3, r4, r5, r6)
-            });
-
-        // Because we represent F_p elements in non-redundant form, we need a final
-        // conditional subtraction to ensure the output is in range.
-        Fp(subtract_p::<VARTIME>(&[u0, u1, u2, u3, u4, u5], &MODULUS))
-    }
-    
-    #[inline]
-    pub const fn mul<const VARTIME: bool>(&self, rhs: &Fp) -> Fp {
-        self.mul_unreduced(rhs).montgomery_reduce::<VARTIME>()
-    }
-
-    #[inline]
-    pub const fn mul_unreduced(&self, rhs: &Fp) -> FpWide<0> {
+    pub const fn mul_unreduced(&self, rhs: &Self) -> FpWide<0, VARTIME> {
         FpWide::from_mul(self, rhs)
-    }
-
-    /// Squares this element.
-    #[inline]
-    pub const fn square<const VARTIME: bool>(&self) -> Self {
-        self.square_unreduced().montgomery_reduce::<VARTIME>()
-    }
-
-    pub const fn square_unreduced(&self) -> FpWide<0> {
-        FpWide::from_square(&self)
     }
 }
 
@@ -873,7 +1017,7 @@ mod test {
             assert!(v < modulus, "{v:?} >= {modulus:?}");
         }
         for _ in 0..1_000_000 {
-            let a = Fp::random(&mut rng);
+            let a: Fp = Fp::random(&mut rng);
             let mut v = a.montgomery_reduce();
             let mut modulus = MODULUS;
             v.reverse();
@@ -884,8 +1028,8 @@ mod test {
 
     #[test]
     fn test_conditional_selection() {
-        let a = Fp([1, 2, 3, 4, 5, 6]);
-        let b = Fp([7, 8, 9, 10, 11, 12]);
+        let a = Fp::<0, false>([1, 2, 3, 4, 5, 6]);
+        let b = Fp::<0, false>([7, 8, 9, 10, 11, 12]);
 
         assert_eq!(
             ConditionallySelectable::conditional_select(&a, &b, Choice::from(0u8)),
@@ -920,7 +1064,7 @@ mod test {
 
     #[test]
     fn test_squaring() {
-        let a = Fp([
+        let a: Fp = Fp([
             0xd215_d276_8e83_191b,
             0x5085_d80f_8fb2_8261,
             0xce9a_032d_df39_3a56,
@@ -937,12 +1081,12 @@ mod test {
             0x14b6_a78d_3ec7_a560,
         ]);
 
-        assert_eq!(a.square::<false>(), b);
+        assert_eq!(a.square(), b);
     }
 
     #[test]
     fn test_multiplication() {
-        let a = Fp([
+        let a: Fp = Fp([
             0x0397_a383_2017_0cd4,
             0x734c_1b2c_9e76_1d30,
             0x5ed2_55ad_9a48_beb5,
@@ -1032,7 +1176,7 @@ mod test {
 
     #[test]
     fn test_negation() {
-        let a = Fp([
+        let a = Fp::<0, false>([
             0x5360_bb59_7867_8032,
             0x7dd2_75ae_799e_128e,
             0x5c5b_5071_ce4f_4dcf,
@@ -1082,7 +1226,7 @@ mod test {
         ]);
 
         for _ in 0..100 {
-            a = a.square::<false>();
+            a = a.square();
             let tmp = a.to_bytes();
             let b = Fp::from_bytes(&tmp).unwrap();
 
@@ -1090,7 +1234,7 @@ mod test {
         }
 
         assert_eq!(
-            -Fp::one(),
+            -Fp::<0, false>::one(),
             Fp::from_bytes(&[
                 26, 1, 17, 234, 57, 127, 230, 154, 75, 27, 167, 182, 67, 75, 172, 215, 100, 119,
                 75, 132, 243, 133, 18, 191, 103, 48, 210, 160, 246, 176, 246, 36, 30, 171, 255,
@@ -1100,7 +1244,7 @@ mod test {
         );
 
         assert!(bool::from(
-            Fp::from_bytes(&[
+            Fp::<0, false>::from_bytes(&[
                 27, 1, 17, 234, 57, 127, 230, 154, 75, 27, 167, 182, 67, 75, 172, 215, 100, 119,
                 75, 132, 243, 133, 18, 191, 103, 48, 210, 160, 246, 176, 246, 36, 30, 171, 255,
                 254, 177, 83, 255, 255, 185, 254, 255, 255, 255, 255, 170, 170
@@ -1108,13 +1252,13 @@ mod test {
             .is_none()
         ));
 
-        assert!(bool::from(Fp::from_bytes(&[0xff; 48]).is_none()));
+        assert!(bool::from(Fp::<0, false>::from_bytes(&[0xff; 48]).is_none()));
     }
 
     #[test]
     fn test_sqrt() {
         // a = 4
-        let a = Fp::from_raw_unchecked([
+        let a: Fp = Fp::from_raw_unchecked([
             0xaa27_0000_000c_fff3,
             0x53cc_0032_fc34_000a,
             0x478f_e97a_6b0a_807f,
@@ -1140,7 +1284,7 @@ mod test {
 
     #[test]
     fn test_inversion() {
-        let a = Fp([
+        let a: Fp = Fp([
             0x43b4_3a50_78ac_2076,
             0x1ce0_7630_46f8_962b,
             0x724a_5276_486d_735c,
@@ -1158,15 +1302,15 @@ mod test {
         ]);
 
         assert_eq!(a.invert().unwrap(), b);
-        assert!(bool::from(Fp::zero().invert().is_none()));
+        assert!(bool::from(Fp::<0, false>::zero().invert().is_none()));
     }
 
     #[test]
     fn test_lexicographic_largest() {
-        assert!(!bool::from(Fp::zero().lexicographically_largest()));
-        assert!(!bool::from(Fp::one().lexicographically_largest()));
+        assert!(!bool::from(Fp::<0, false>::zero().lexicographically_largest()));
+        assert!(!bool::from(Fp::<0, false>::one().lexicographically_largest()));
         assert!(!bool::from(
-            Fp::from_raw_unchecked([
+            Fp::<0, false>::from_raw_unchecked([
                 0xa1fa_ffff_fffe_5557,
                 0x995b_fff9_76a3_fffe,
                 0x03f4_1d24_d174_ceb4,
@@ -1177,7 +1321,7 @@ mod test {
             .lexicographically_largest()
         ));
         assert!(bool::from(
-            Fp::from_raw_unchecked([
+            Fp::<0, false>::from_raw_unchecked([
                 0x1804_0000_0001_5554,
                 0x8550_0005_3ab0_0001,
                 0x633c_b57c_253c_276f,
@@ -1188,7 +1332,7 @@ mod test {
             .lexicographically_largest()
         ));
         assert!(bool::from(
-            Fp::from_raw_unchecked([
+            Fp::<0, false>::from_raw_unchecked([
                 0x43f5_ffff_fffc_aaae,
                 0x32b7_fff2_ed47_fffd,
                 0x07e8_3a49_a2e9_9d69,
@@ -1205,7 +1349,7 @@ mod test {
     fn test_zeroize() {
         use zeroize::Zeroize;
 
-        let mut a = Fp::one();
+        let mut a: Fp = Fp::one();
         a.zeroize();
         assert!(bool::from(a.is_zero()));
     }

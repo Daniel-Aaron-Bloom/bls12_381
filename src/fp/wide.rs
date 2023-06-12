@@ -2,16 +2,18 @@ use core::ops::{Add, Sub};
 
 use crate::{
     fp::Fp,
-    util::{adc, mac, sbb, slc},
+    util::{adc, mac, sbb, slc, carrying_add, MulOp, SquareOp, OtherMag, borrowing_sub},
 };
 
-use super::{Mag, Never, NonZero, Ops};
+use super::{Mag, Never, NonZero, Ops, MontOp, DoubleOp};
 
 #[inline(always)]
 /// The return value is bounded by $(mp^2 + Rp − p) / R$
-/// where $mp^2$ is the modulus of `v`. This means `m` must be 87 or lower, as
+/// where $m$ is the magnitude of the `v`, (i.e. $mp^2$ is the modulus of `v`), $R$ is $2^384$,
+/// and $p$ is $4002409555221667393417789825735904156556882819939007885332058136124031650490837864442687629129015664037894272559787$.
+/// This means `m` must be 87 or lower, as
 /// a value 88 or higher would result in overflow.
-pub const fn montgomery_reduce_wide(v: &[u64; 12]) -> [u64; 6] {
+pub(super) const fn montgomery_reduce_wide(v: &[u64; 12]) -> ([u64; 6], bool) {
     use super::{INV, MODULUS};
 
     // The Montgomery reduction here is based on Algorithm 14.32 in
@@ -26,7 +28,8 @@ pub const fn montgomery_reduce_wide(v: &[u64; 12]) -> [u64; 6] {
     let (r3, carry) = mac(t3, k, MODULUS[3], carry);
     let (r4, carry) = mac(t4, k, MODULUS[4], carry);
     let (r5, carry) = mac(t5, k, MODULUS[5], carry);
-    let (r6, r7) = adc(t6, 0, carry);
+    //let (r6, r7) = adc(t6, 0, carry);
+    let (r6, r7) = carrying_add(t6, carry, false);
 
     let k = r1.wrapping_mul(INV);
     let (_, carry) = mac(r1, k, MODULUS[0], 0);
@@ -35,7 +38,8 @@ pub const fn montgomery_reduce_wide(v: &[u64; 12]) -> [u64; 6] {
     let (r4, carry) = mac(r4, k, MODULUS[3], carry);
     let (r5, carry) = mac(r5, k, MODULUS[4], carry);
     let (r6, carry) = mac(r6, k, MODULUS[5], carry);
-    let (r7, r8) = adc(t7, r7, carry);
+    // let (r7, r8) = adc(t7, r7, carry);
+    let (r7, r8) = carrying_add(t7, carry, r7);
 
     let k = r2.wrapping_mul(INV);
     let (_, carry) = mac(r2, k, MODULUS[0], 0);
@@ -44,7 +48,8 @@ pub const fn montgomery_reduce_wide(v: &[u64; 12]) -> [u64; 6] {
     let (r5, carry) = mac(r5, k, MODULUS[3], carry);
     let (r6, carry) = mac(r6, k, MODULUS[4], carry);
     let (r7, carry) = mac(r7, k, MODULUS[5], carry);
-    let (r8, r9) = adc(t8, r8, carry);
+    // let (r8, r9) = adc(t8, r8, carry);
+    let (r8, r9) = carrying_add(t8, carry, r8);
 
     let k = r3.wrapping_mul(INV);
     let (_, carry) = mac(r3, k, MODULUS[0], 0);
@@ -53,7 +58,8 @@ pub const fn montgomery_reduce_wide(v: &[u64; 12]) -> [u64; 6] {
     let (r6, carry) = mac(r6, k, MODULUS[3], carry);
     let (r7, carry) = mac(r7, k, MODULUS[4], carry);
     let (r8, carry) = mac(r8, k, MODULUS[5], carry);
-    let (r9, r10) = adc(t9, r9, carry);
+    // let (r9, r10) = adc(t9, r9, carry);
+    let (r9, r10) = carrying_add(t9, carry, r9);
 
     let k = r4.wrapping_mul(INV);
     let (_, carry) = mac(r4, k, MODULUS[0], 0);
@@ -62,7 +68,8 @@ pub const fn montgomery_reduce_wide(v: &[u64; 12]) -> [u64; 6] {
     let (r7, carry) = mac(r7, k, MODULUS[3], carry);
     let (r8, carry) = mac(r8, k, MODULUS[4], carry);
     let (r9, carry) = mac(r9, k, MODULUS[5], carry);
-    let (r10, r11) = adc(t10, r10, carry);
+    // let (r10, r11) = adc(t10, r10, carry);
+    let (r10, r11) = carrying_add(t10, carry, r10);
 
     let k = r5.wrapping_mul(INV);
     let (_, carry) = mac(r5, k, MODULUS[0], 0);
@@ -71,15 +78,16 @@ pub const fn montgomery_reduce_wide(v: &[u64; 12]) -> [u64; 6] {
     let (r8, carry) = mac(r8, k, MODULUS[3], carry);
     let (r9, carry) = mac(r9, k, MODULUS[4], carry);
     let (r10, carry) = mac(r10, k, MODULUS[5], carry);
-    let (r11, _carry) = adc(t11, r11, carry);
+    // let (r11, carry) = adc(t11, r11, carry);
+    let (r11, carry) = carrying_add(t11, carry, r11);
 
     // The caller must attempt to subtract the modulus, to ensure the value
     // is smaller than the modulus
-    [r6, r7, r8, r9, r10, r11]
+    ([r6, r7, r8, r9, r10, r11], carry)
 }
 
 #[inline]
-const fn mul_wide(lhs: &[u64; 6], rhs: &[u64; 6]) -> [u64; 12] {
+pub(super) const fn mul_wide(lhs: &[u64; 6], rhs: &[u64; 6]) -> [u64; 12] {
     let (t0, carry) = mac(0, lhs[0], rhs[0], 0);
     let (t1, carry) = mac(0, lhs[0], rhs[1], carry);
     let (t2, carry) = mac(0, lhs[0], rhs[2], carry);
@@ -126,7 +134,7 @@ const fn mul_wide(lhs: &[u64; 6], rhs: &[u64; 6]) -> [u64; 12] {
 }
 
 #[inline]
-pub const fn square_wide(v: &[u64; 6]) -> [u64; 12] {
+pub(crate) const fn square_wide(v: &[u64; 6]) -> [u64; 12] {
     let (t1, carry) = mac(0, v[0], v[1], 0);
     let (t2, carry) = mac(0, v[0], v[2], carry);
     let (t3, carry) = mac(0, v[0], v[3], carry);
@@ -177,7 +185,7 @@ pub const fn square_wide(v: &[u64; 6]) -> [u64; 12] {
 
 /// Add two elements.
 #[inline]
-const fn add_wide(lhs: &[u64; 12], rhs: &[u64; 12]) -> [u64; 12] {
+const fn add_wide_c(lhs: &[u64; 12], rhs: &[u64; 12]) -> ([u64; 12], bool) {
     let (d0, carry) = adc(lhs[0], rhs[0], 0);
     let (d1, carry) = adc(lhs[1], rhs[1], carry);
     let (d2, carry) = adc(lhs[2], rhs[2], carry);
@@ -189,25 +197,82 @@ const fn add_wide(lhs: &[u64; 12], rhs: &[u64; 12]) -> [u64; 12] {
     let (d8, carry) = adc(lhs[8], rhs[8], carry);
     let (d9, carry) = adc(lhs[9], rhs[9], carry);
     let (d10, carry) = adc(lhs[10], rhs[10], carry);
-    let (d11, _carry) = adc(lhs[11], rhs[11], carry);
+    let (d11, carry) = adc(lhs[11], rhs[11], carry);
 
-    [d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11]
+    ([d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11], carry != 0)
 }
 
 #[inline]
-pub const fn double_wide(v: &[u64; 12]) -> [u64; 12] {
-    let (d0, carry) = slc(v[0], 1, 0);
-    let (d1, carry) = slc(v[1], 1, carry);
-    let (d2, carry) = slc(v[2], 1, carry);
-    let (d3, carry) = slc(v[3], 1, carry);
-    let (d4, carry) = slc(v[4], 1, carry);
-    let (d5, carry) = slc(v[5], 1, carry);
-    let (d6, carry) = slc(v[6], 1, carry);
-    let (d7, carry) = slc(v[7], 1, carry);
-    let (d8, carry) = slc(v[8], 1, carry);
-    let (d9, carry) = slc(v[9], 1, carry);
-    let (d10, carry) = slc(v[10], 1, carry);
-    let (d11, _carry) = slc(v[11], 1, carry);
+const fn add_wide(lhs: &[u64; 12], rhs: &[u64; 12]) -> [u64; 12] {
+    let (v, _carry) = add_wide_c(lhs, rhs);
+
+    if cfg!(debug_assertions) && _carry {
+        panic!("carry != 0");
+    }
+
+    v
+}
+
+
+#[inline]
+const fn sub_wide<const VARTIME: bool>(lhs: &[u64; 12], rhs: &[u64; 12], mut modulus: [u64; 12]) -> [u64; 12] {
+    let (r0, borrow) = borrowing_sub(lhs[0], rhs[0], false);
+    let (r1, borrow) = borrowing_sub(lhs[1], rhs[1], borrow);
+    let (r2, borrow) = borrowing_sub(lhs[2], rhs[2], borrow);
+    let (r3, borrow) = borrowing_sub(lhs[3], rhs[3], borrow);
+    let (r4, borrow) = borrowing_sub(lhs[4], rhs[4], borrow);
+    let (r5, borrow) = borrowing_sub(lhs[5], rhs[5], borrow);
+    let (r6, borrow) = borrowing_sub(lhs[6], rhs[6], borrow);
+    let (r7, borrow) = borrowing_sub(lhs[7], rhs[7], borrow);
+    let (r8, borrow) = borrowing_sub(lhs[8], rhs[8], borrow);
+    let (r9, borrow) = borrowing_sub(lhs[9], rhs[9], borrow);
+    let (r10, borrow) = borrowing_sub(lhs[10], rhs[10], borrow);
+    let (r11, borrow) = borrowing_sub(lhs[11], rhs[11], borrow);
+
+    let v = [r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11];
+    match VARTIME {
+        true if borrow => add_wide_c(&v, &modulus).0,
+        true => v,
+        false => {
+            // If underflow occurred on the final limb, borrow = 0xfff...fff, otherwise
+            // borrow = 0x000...000. Thus, we use it as a mask!
+            let borrow = -(borrow as i64) as u64;
+            modulus[0] &= borrow;
+            modulus[1] &= borrow;
+            modulus[2] &= borrow;
+            modulus[3] &= borrow;
+            modulus[4] &= borrow;
+            modulus[5] &= borrow;
+            modulus[6] &= borrow;
+            modulus[7] &= borrow;
+            modulus[8] &= borrow;
+            modulus[9] &= borrow;
+            modulus[10] &= borrow;
+            modulus[11] &= borrow;
+            add_wide_c(&v, &modulus).0
+        }
+    }
+}
+
+
+#[inline]
+pub const fn double_wide(v: &[u64; 12], pow: u32) -> [u64; 12] {
+    let (d0, carry) = slc(v[0], pow, 0);
+    let (d1, carry) = slc(v[1], pow, carry);
+    let (d2, carry) = slc(v[2], pow, carry);
+    let (d3, carry) = slc(v[3], pow, carry);
+    let (d4, carry) = slc(v[4], pow, carry);
+    let (d5, carry) = slc(v[5], pow, carry);
+    let (d6, carry) = slc(v[6], pow, carry);
+    let (d7, carry) = slc(v[7], pow, carry);
+    let (d8, carry) = slc(v[8], pow, carry);
+    let (d9, carry) = slc(v[9], pow, carry);
+    let (d10, carry) = slc(v[10], pow, carry);
+    let (d11, _carry) = slc(v[11], pow, carry);
+
+    if cfg!(debug_assertions) && _carry != 0 {
+        panic!("carry != 0");
+    }
 
     [d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11]
 }
@@ -215,88 +280,209 @@ pub const fn double_wide(v: &[u64; 12]) -> [u64; 12] {
 /// Negates an element by subtracting it from the `Self::MODULUS`
 #[inline]
 const fn negate_wide(v: &[u64; 12], modulus: &[u64; 12]) -> [u64; 12] {
-    let (d0, borrow) = sbb(modulus[0], v[0], 0);
-    let (d1, borrow) = sbb(modulus[1], v[1], borrow);
-    let (d2, borrow) = sbb(modulus[2], v[2], borrow);
-    let (d3, borrow) = sbb(modulus[3], v[3], borrow);
-    let (d4, borrow) = sbb(modulus[4], v[4], borrow);
-    let (d5, borrow) = sbb(modulus[5], v[5], borrow);
-    let (d6, borrow) = sbb(modulus[6], v[6], borrow);
-    let (d7, borrow) = sbb(modulus[7], v[7], borrow);
-    let (d8, borrow) = sbb(modulus[8], v[8], borrow);
-    let (d9, borrow) = sbb(modulus[9], v[9], borrow);
-    let (d10, borrow) = sbb(modulus[10], v[10], borrow);
-    let (d11, _) = sbb(modulus[11], v[11], borrow);
+    let (d0, borrow) = borrowing_sub(modulus[0], v[0], false);
+    let (d1, borrow) = borrowing_sub(modulus[1], v[1], borrow);
+    let (d2, borrow) = borrowing_sub(modulus[2], v[2], borrow);
+    let (d3, borrow) = borrowing_sub(modulus[3], v[3], borrow);
+    let (d4, borrow) = borrowing_sub(modulus[4], v[4], borrow);
+    let (d5, borrow) = borrowing_sub(modulus[5], v[5], borrow);
+    let (d6, borrow) = borrowing_sub(modulus[6], v[6], borrow);
+    let (d7, borrow) = borrowing_sub(modulus[7], v[7], borrow);
+    let (d8, borrow) = borrowing_sub(modulus[8], v[8], borrow);
+    let (d9, borrow) = borrowing_sub(modulus[9], v[9], borrow);
+    let (d10, borrow) = borrowing_sub(modulus[10], v[10], borrow);
+    let (d11, _borrow) = borrowing_sub(modulus[11], v[11], borrow);
+
+    if cfg!(debug_assertions) && _borrow {
+        panic!("borrow != 0");
+    }
 
     [d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11]
-}
-
-pub trait MulOp<const MAG: usize>: Mag<[u64; 6]> {
-    type MulOut;
-    fn mul(lhs: &Self, rhs: &Self::Mag<MAG>) -> Self::MulOut;
-}
-pub trait SquareOp: Mag<[u64; 6]> {
-    type SquareOut;
-    fn square(lhs: &Self) -> Self::SquareOut;
 }
 
 /// The unreduced result of `Fp` multiplication.
 /// The internal representation of this type is twelve 64-bit unsigned
 /// integers in little-endian order. `FpWide` values are always in
 /// double Montgomery form; i.e., FpWide<M>(a) = a*R^2 mod M*p^2, with R = 2^384.
+/// MAGNITUDE must be 95 or less to prevent overflow
 #[derive(Debug, Clone, Copy)]
-pub struct FpWide<const MAGNITUDE: usize>([u64; 12]);
+pub struct FpWide<const MAGNITUDE: usize, const VARTIME: bool = false>([u64; 12]);
+
+impl<const MAGNITUDE: usize, const VARTIME: bool> OtherMag for FpWide<MAGNITUDE, VARTIME> {
+    type Mag<const MAG2: usize> = FpWide<MAG2, VARTIME>;
+}
 
 // MAGNITUDE cannot be above 87, or else
-impl<const MAGNITUDE: usize> FpWide<MAGNITUDE> {
+impl<const MAGNITUDE: usize, const VARTIME: bool> FpWide<MAGNITUDE, VARTIME> {
     #[inline(always)]
-    pub const fn montgomery_reduce<const VARTIME: bool>(self) -> Fp {
-        use super::{subtract_p, MODULUS, P2, P4, P8};
-        let mut v = montgomery_reduce_wide(&self.0);
+    pub const fn vartime<const VARTIME2: bool>(self) -> FpWide<MAGNITUDE, VARTIME2> {
+        FpWide(self.0)
+    }
+}
 
-        if MAGNITUDE >= 68 {
-            // 68 indicates a mod of 69 p^2
-            // when f is bounded by (69 p^2 + Rp − p) / R
-            // and 68p/R < 7 < 69 p/R < 8
-            // means max(f) > 8p
-            v = subtract_p::<VARTIME>(&v, &P8)
+#[inline(always)]
+pub const fn montgomery_reduce<const MAGNITUDE: usize, const VARTIME: bool>(v: &[u64; 12]) -> [u64; 6] {
+    use super::{subtract_p, P5};
+    let (mut v, msb) = montgomery_reduce_wide(v);
+
+    if MAGNITUDE >= 87 {
+        // 86 indicates a mod of $87p^2$
+        // When you plug 87 into `montgomery_reduce_wide` for $m$
+        // you get an output bound of just under $2^384$
+        // 87 indicates a mod of $88p^2$
+        // When you plug 88 into `montgomery_reduce_wide` for $m$
+        // you get an output bound of just over $2^384$
+        // So anything value which is mod $88p^2$ and above might overflow,
+        // We reduce that by 5p so it fits more neatly, but account for msb
+        v = subtract_p::<VARTIME>(msb, &v, &P5)
+    } else if MAGNITUDE >= 78 {
+        // 78 indicates a mod of 79p^2
+        // When you plug 79 into `montgomery_reduce_wide` for $m$
+        // you get an output bound of just over $9p$
+        // We reduce that by 5p so it fits more neatly
+        v = subtract_p::<VARTIME>(false, &v, &P5)
+    }
+    v
+}
+
+macro_rules! montgomery_reduce {
+    ($($(($($ua:literal),+) => $ub:literal),+ $(,)?)?) => {$($($(
+impl<const VARTIME: bool> MontOp for FpWide<$ua, VARTIME> {
+    type MontOut = Fp<$ub, VARTIME>;
+    #[inline(always)]
+    fn montgomery_reduce(lhs: &Self) -> Self::MontOut {
+        Fp(montgomery_reduce::<$ua, VARTIME>(&lhs.0))
+    }
+}
+impl<const VARTIME: bool> FpWide<$ua, VARTIME> {
+    #[inline(always)]
+    pub const fn montgomery_reduce(&self) -> Fp<$ub, VARTIME> {
+        Fp(montgomery_reduce::<$ua, VARTIME>(&self.0))
+    }
+}
+    )+)+)?};
+}
+
+montgomery_reduce!{
+    // 0 indicates a mod of 1p^2
+    // When you plug 1 into `montgomery_reduce_wide` for $m$
+    // you get an output bound of just over $1p$ (indicated by `=> 1`)
+    //
+    // 8 indicates a mod of 9p^2
+    // When you plug 9 into `montgomery_reduce_wide` for $m$
+    // you get an output bound of just under $2p$ (indicated by `=> 1`)
+    (0, 1, 2, 3, 4, 5, 6, 7, 8) => 1,
+
+    // 9 indicates a mod of 10p^2
+    // When you plug 10 into `montgomery_reduce_wide` for $m$
+    // you get an output bound of just over $2p$ (indicated by `=> 2`)
+    //
+    // 28 indicates a mod of 29p^2
+    // When you plug 29 into `montgomery_reduce_wide` for $m$
+    // you get an output bound of just under $3p$ (indicated by `=> 2`)
+    (9, 10, 11, 12, 13, 14, 15, 16, 17, 18) => 2,
+
+    // 19 indicates a mod of 20p^2
+    // When you plug 10 into `montgomery_reduce_wide` for $m$
+    // you get an output bound of just over $3p$ (indicated by `=> 3`)
+    //
+    // 28 indicates a mod of 29p^2
+    // When you plug 29 into `montgomery_reduce_wide` for $m$
+    // you get an output bound of just under $4p$ (indicated by `=> 3`)
+    (19, 20, 21, 22, 23, 24, 25, 26, 27, 28) => 3,
+
+    // 29 indicates a mod of 30p^2
+    // When you plug 30 into `montgomery_reduce_wide` for $m$
+    // you get an output bound of just over $4p$ (indicated by `=> 4`)
+    //
+    // 38 indicates a mod of 39p^2
+    // When you plug 39 into `montgomery_reduce_wide` for $m$
+    // you get an output bound of just under $5p$ (indicated by `=> 4`)
+    (29, 30, 31, 32, 33, 34, 35, 36, 37, 38) => 4,
+
+    // 39 indicates a mod of 40p^2
+    // When you plug 40 into `montgomery_reduce_wide` for $m$
+    // you get an output bound of just over $5p$ (indicated by `=> 5`)
+    //
+    // 48 indicates a mod of 49p^2
+    // When you plug 49 into `montgomery_reduce_wide` for $m$
+    // you get an output bound of just under $6p$ (indicated by `=> 5`)
+    (39, 40, 41, 42, 43, 44, 45, 46, 47, 48) => 5,
+
+    // 49 indicates a mod of 50p^2
+    // When you plug 50 into `montgomery_reduce_wide` for $m$
+    // you get an output bound of just over $6p$ (indicated by `=> 6`)
+    //
+    // 58 indicates a mod of 59p^2
+    // When you plug 59 into `montgomery_reduce_wide` for $m$
+    // you get an output bound of just under $7p$ (indicated by `=> 6`)
+    (49, 50, 51, 52, 53, 54, 55, 56, 57, 58) => 6,
+
+    // 59 indicates a mod of 60p^2
+    // When you plug 60 into `montgomery_reduce_wide` for $m$
+    // you get an output bound of just over $7p$ (indicated by `=> 7`)
+    //
+    // 67 indicates a mod of 68p^2
+    // When you plug 68 into `montgomery_reduce_wide` for $m$
+    // you get an output bound of just under $8p$ (indicated by `=> 7`)
+    (59, 60, 61, 62, 63, 64, 65, 66, 67) => 7,
+
+    // 68 indicates a mod of 69p^2
+    // When you plug 69 into `montgomery_reduce_wide` for $m$
+    // you get an output bound of just over $8p$ (indicated by `=> 8`)
+    //
+    // 77 indicates a mod of 78p^2
+    // When you plug 78 into `montgomery_reduce_wide` for $m$
+    // you get an output bound of just under $9p$ (indicated by `=> 8`)
+    (68, 69, 70, 71, 72, 73, 74, 75, 76, 77) => 8,
+
+    // Values over 9p are in a weird situation because 10p cannot be stored
+    // properly in 384 bits. As such they get reduced by 5p by `montgomery_reduce`.
+    (78, 79, 80, 81, 82, 83, 84, 85, 86, 87) => 4,
+    (88, 89, 90, 91, 92, 93, 94, 95) => 5,
+}
+
+// MAGNITUDE cannot be above 87, or else
+impl<const MAGNITUDE: usize, const VARTIME: bool> FpWide<MAGNITUDE, VARTIME> {
+    #[inline(always)]
+    pub const fn montgomery_reduce_full(self) -> Fp<0, VARTIME> {
+        use super::{subtract_p, MODULUS, P2, P4, P8};
+        let (mut v, msb) = montgomery_reduce_wide(&self.0);
+
+        if MAGNITUDE >= 87 {
+            v = subtract_p::<VARTIME>(msb, &v, &P8);
+        } else if MAGNITUDE >= 68 {
+            v = subtract_p::<VARTIME>(false, &v, &P8);
         }
 
         if MAGNITUDE >= 29 {
-            // 29 indicates a mod of 30 p^2
-            // when f is bounded by (30 p^2 + Rp − p) / R
-            // and 29p/R < 3 < 30 p/R < 4
-            // means max(f) > 4p
-            v = subtract_p::<VARTIME>(&v, &P4)
+            v = subtract_p::<VARTIME>(false, &v, &P4);
         }
 
         if MAGNITUDE >= 9 {
-            // 9 indicates a mod of 10 p^2
-            // when f is bounded by (10 p^2 + Rp − p) / R
-            // and 9p/R < 1 < 10p/R < 2
-            // means max(f) > 2p
-            v = subtract_p::<VARTIME>(&v, &P2)
+            v = subtract_p::<VARTIME>(false, &v, &P2);
         }
 
-        // when f is bounded by (p^2 + Rp − p) / R
-        // and p/R < 1
-        // means max(f) < 2p
-        Fp(subtract_p::<VARTIME>(&v, &MODULUS))
+        Fp(subtract_p::<VARTIME>(false, &v, &MODULUS))
     }
 }
 macro_rules! mul_helper {
-    ($ua:literal {$($ub:literal)*}) => {
-$(
-impl MulOp<$ub> for Fp<$ua> {
-    type MulOut = FpWide<{($ua+1)*($ub+1)-1}>;
+    ($ua:literal {$($ub:literal)*}) => {$(
+impl<const VARTIME: bool> MulOp<$ub> for Fp<$ua, VARTIME> {
+    type MulOut = FpWide<{($ua+1)*($ub+1)-1}, VARTIME>;
     fn mul(lhs: &Self, rhs: &Self::Mag<$ub>) -> Self::MulOut {
         FpWide(mul_wide(&lhs.0, &rhs.0))
     }
 })*
-impl SquareOp for Fp<$ua> {
-    type SquareOut = FpWide<{($ua+1)*($ua+1)-1}>;
+impl<const VARTIME: bool> SquareOp for Fp<$ua, VARTIME> {
+    type SquareOut = FpWide<{($ua+1)*($ua+1)-1}, VARTIME>;
     fn square(lhs: &Self) -> Self::SquareOut {
         FpWide(square_wide(&lhs.0))
+    }
+}
+impl<const VARTIME: bool> Fp<$ua, VARTIME> {
+    pub const fn square_wide(&self) -> FpWide<{($ua+1)*($ua+1)-1}, VARTIME> {
+        FpWide(square_wide(&self.0))
     }
 }
     };
@@ -313,14 +499,45 @@ macro_rules! mul_impl {
 
 mul_impl!{0,1,2,3,4,5,6,7,8}
 
-impl FpWide<0> {
+macro_rules! impl_double {
+    ($pow:literal: $($($ua:literal),+ $(,)?)?) => {$($(
+impl<const VARTIME: bool> DoubleOp<$pow> for FpWide<$ua, VARTIME> {
+    type DoubleOut = FpWide<{($ua+1)*(1<<($pow+1))-1}, VARTIME>;
+    fn double(lhs: &Self) -> Self::DoubleOut {
+        FpWide(double_wide(&lhs.0, $pow+1))
+    }
+}
+    )+)?};
+}
+
+impl_double!{
+    0: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+    10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+    20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+    30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+    40, 41, 42, 43, 44, 45, 46, 47
+}
+impl_double!{
+    1: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+    10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+    20, 21, 22, 23
+}
+impl_double!{
+    2: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+    10, 11
+}
+impl_double!{3: 0, 1, 2, 3, 4, 5}
+impl_double!{4: 0, 1, 2}
+impl_double!{5: 0}
+
+impl<const VARTIME: bool> FpWide<0, VARTIME> {
     #[inline(always)]
-    pub const fn from_mul(lhs: &Fp, rhs: &Fp) -> Self {
+    pub const fn from_mul(lhs: &Fp<0, VARTIME>, rhs: &Fp<0, VARTIME>) -> Self {
         Self(mul_wide(&lhs.0, &rhs.0))
     }
 
     #[inline(always)]
-    pub const fn from_square(v: &Fp) -> Self {
+    pub const fn from_square(v: &Fp<0, VARTIME>) -> Self {
         Self(square_wide(&v.0))
     }
 }
@@ -330,156 +547,154 @@ const MODULUS_INCREMENT: [u64; 12] = square_wide(&super::MODULUS);
 
 macro_rules! wide_impl {
     ($($($ua:literal),+ $(,)?)?) => {$($(
-impl Mag<[u64; 12]> for FpWide<$ua> {
-    type Prev = FpWide<{$ua - 1}>;
-    type Next = FpWide<{$ua + 1}>;
-    type Mag<const MAGNITUDE: usize> = FpWide<MAGNITUDE>;
+impl<const VARTIME: bool> Mag<1, [u64; 12]> for FpWide<$ua, VARTIME> {
+    type Prev = FpWide<{$ua - 1}, VARTIME>;
+    type Next = FpWide<{$ua + 1}, VARTIME>;
 
     /// A multiple of the prime that is larger than this element could be (p^2).
     const MODULUS: [u64; 12] = add_wide(&Self::Prev::MODULUS, &MODULUS_INCREMENT);
 
     #[inline(always)]
-    fn make(v: [u64; 12]) -> Self {
+    fn make([v]: [[u64; 12]; 1]) -> Self {
         Self(v)
     }
     #[inline(always)]
-    fn data(&self) -> &[u64; 12] {
-        &self.0
+    fn data(&self) -> [&[u64; 12]; 1] {
+        [&self.0]
     }
     #[inline(always)]
     fn negate(&self) -> Self {
-        Self::make(negate_wide(self.data(), &Self::MODULUS))
+        Self::make([negate_wide(self.data()[0], &Self::MODULUS)])
     }
 }
 
-impl NonZero for FpWide<$ua> {}
+impl<const VARTIME: bool> NonZero for FpWide<$ua, VARTIME> {}
     )+)?};
 }
 
-impl Mag<[u64; 12]> for FpWide<0> {
+impl<const VARTIME: bool> Mag<1, [u64; 12]> for FpWide<0, VARTIME> {
     type Prev = Never;
-    type Next = FpWide<1>;
-    type Mag<const MAGNITUDE: usize> = FpWide<MAGNITUDE>;
+    type Next = FpWide<1, VARTIME>;
 
     /// A multiple of the prime that is larger than this element could be (p^2).
     const MODULUS: [u64; 12] = MODULUS_INCREMENT;
 
     #[inline(always)]
-    fn make(v: [u64; 12]) -> Self {
+    fn make([v]: [[u64; 12]; 1]) -> Self {
         Self(v)
     }
     #[inline(always)]
-    fn data(&self) -> &[u64; 12] {
-        &self.0
+    fn data(&self) -> [&[u64; 12]; 1] {
+        [&self.0]
     }
     #[inline(always)]
     fn negate(&self) -> Self {
-        Self::make(negate_wide(self.data(), &Self::MODULUS))
+        Self::make([negate_wide(self.data()[0], &Self::MODULUS)])
     }
 }
 
-wide_impl! {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84}
-impl Mag<[u64; 12]> for FpWide<85> {
-    type Prev = FpWide<84>;
+wide_impl! {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94}
+impl<const VARTIME: bool> Mag<1, [u64; 12]> for FpWide<95, VARTIME> {
+    type Prev = FpWide<94, VARTIME>;
     type Next = Never;
-    type Mag<const MAGNITUDE: usize> = FpWide<MAGNITUDE>;
 
     /// A multiple of the prime that is larger than this element could be (p^2).
     const MODULUS: [u64; 12] = add_wide(&Self::Prev::MODULUS, &MODULUS_INCREMENT);
 
     #[inline(always)]
-    fn make(v: [u64; 12]) -> Self {
+    fn make([v]: [[u64; 12]; 1]) -> Self {
         Self(v)
     }
     #[inline(always)]
-    fn data(&self) -> &[u64; 12] {
-        &self.0
+    fn data(&self) -> [&[u64; 12]; 1] {
+        [&self.0]
     }
     #[inline(always)]
     fn negate(&self) -> Self {
-        Self::make(negate_wide(self.data(), &Self::MODULUS))
+        Self::make([negate_wide(self.data()[0], &Self::MODULUS)])
     }
 }
 
-impl<const MAG2: usize> Ops<[u64; 12], MAG2> for FpWide<0>
+impl<const MAG2: usize, const VARTIME: bool> Ops<1, [u64; 12], MAG2> for FpWide<0, VARTIME>
 where
-    FpWide<MAG2>: Mag<[u64; 12]>,
+    FpWide<MAG2, VARTIME>: Mag<1, [u64; 12]>,
 {
-    type OpOut = <FpWide<MAG2> as Mag<[u64; 12]>>::Next;
+    type OpOut = <FpWide<MAG2, VARTIME> as Mag<1, [u64; 12]>>::Next;
     #[inline(always)]
-    fn add(lhs: &Self, rhs: &FpWide<MAG2>) -> Self::OpOut {
-        Mag::make(add_wide(&lhs.0, &rhs.0))
+    fn add(lhs: &Self, rhs: &FpWide<MAG2, VARTIME>) -> Self::OpOut {
+        Mag::make([add_wide(&lhs.0, &rhs.0)])
     }
     #[inline(always)]
-    fn sub(lhs: &Self, rhs: &FpWide<MAG2>) -> Self::OpOut {
-        Mag::make(add_wide(&lhs.0, &rhs.negate().0))
+    fn sub(lhs: &Self, rhs: &FpWide<MAG2, VARTIME>) -> Self::OpOut {
+        Mag::make([sub_wide::<VARTIME>(&lhs.0, &rhs.0, <Self::OpOut>::MODULUS)])
     }
 }
 
-impl<const MAG1: usize, const MAG2: usize> Ops<[u64; 12], MAG2> for FpWide<MAG1>
+impl<const MAG1: usize, const MAG2: usize, const VARTIME: bool> Ops<1, [u64; 12], MAG2> for FpWide<MAG1, VARTIME>
 where
-    FpWide<MAG1>: Mag<[u64; 12]> + NonZero,
-    <FpWide<MAG1> as Mag<[u64; 12]>>::Prev: Ops<[u64; 12], MAG2>,
-    FpWide<MAG2>: Mag<[u64; 12]>,
+    FpWide<MAG1, VARTIME>: Mag<1, [u64; 12]> + NonZero,
+    <FpWide<MAG1, VARTIME> as Mag<1, [u64; 12]>>::Prev: Ops<1, [u64; 12], MAG2>,
+    FpWide<MAG2, VARTIME>: Mag<1, [u64; 12]>,
 {
-    type OpOut = <<<FpWide<MAG1> as Mag<[u64; 12]>>::Prev as Ops<[u64; 12], MAG2>>::OpOut as Mag<
+    type OpOut = <<<FpWide<MAG1, VARTIME> as Mag<1, [u64; 12]>>::Prev as Ops<1, [u64; 12], MAG2>>::OpOut as Mag<
+        1,
         [u64; 12],
     >>::Next;
     #[inline(always)]
     fn add(lhs: &Self, rhs: &Self::Mag<MAG2>) -> Self::OpOut
     where
-        Self::Mag<MAG2>: Mag<[u64; 12]>,
+        Self::Mag<MAG2>: Mag<1, [u64; 12]>,
     {
-        Mag::make(add_wide(lhs.data(), rhs.data()))
+        Mag::make([add_wide(lhs.data()[0], rhs.data()[0])])
     }
     #[inline(always)]
     fn sub(lhs: &Self, rhs: &Self::Mag<MAG2>) -> Self::OpOut
     where
-        Self::Mag<MAG2>: Mag<[u64; 12]>,
+        Self::Mag<MAG2>: Mag<1, [u64; 12]>,
     {
-        Mag::make(add_wide(&lhs.0, &(rhs.negate()).data()))
+        Mag::make([sub_wide::<VARTIME>(&lhs.0, &rhs.0, <Self::OpOut>::MODULUS)])
     }
 }
 
-impl<'a, 'b, const MAG1: usize, const MAG2: usize> Add<&'b FpWide<MAG2>> for &'a FpWide<MAG1>
+impl<'a, 'b, const MAG1: usize, const MAG2: usize, const VARTIME: bool> Add<&'b FpWide<MAG2, VARTIME>> for &'a FpWide<MAG1, VARTIME>
 where
-    FpWide<MAG1>: Ops<[u64; 12], MAG2>,
-    <FpWide<MAG1> as Mag<[u64; 12]>>::Mag<MAG2>: Mag<[u64; 12]>,
-    for<'j> &'j FpWide<MAG2>: Into<&'j <FpWide<MAG1> as Mag<[u64; 12]>>::Mag<MAG2>>,
+    FpWide<MAG1, VARTIME>: Ops<1, [u64; 12], MAG2>,
+    <FpWide<MAG1, VARTIME> as OtherMag>::Mag<MAG2>: Mag<1, [u64; 12]>,
+    for<'j> &'j FpWide<MAG2, VARTIME>: Into<&'j <FpWide<MAG1, VARTIME> as OtherMag>::Mag<MAG2>>,
 {
-    type Output = <FpWide<MAG1> as Ops<[u64; 12], MAG2>>::OpOut;
+    type Output = <FpWide<MAG1, VARTIME> as Ops<1, [u64; 12], MAG2>>::OpOut;
 
     #[inline(always)]
-    fn add(self, rhs: &'b FpWide<MAG2>) -> Self::Output {
+    fn add(self, rhs: &'b FpWide<MAG2, VARTIME>) -> Self::Output {
         Ops::add(self, rhs.into())
     }
 }
-impl<'a, 'b, const MAG1: usize, const MAG2: usize> Sub<&'b FpWide<MAG2>> for &'a FpWide<MAG1>
+impl<'a, 'b, const MAG1: usize, const MAG2: usize, const VARTIME: bool> Sub<&'b FpWide<MAG2, VARTIME>> for &'a FpWide<MAG1, VARTIME>
 where
-    FpWide<MAG1>: Ops<[u64; 12], MAG2>,
-    <FpWide<MAG1> as Mag<[u64; 12]>>::Mag<MAG2>: Mag<[u64; 12]>,
-    for<'j> &'j FpWide<MAG2>: Into<&'j <FpWide<MAG1> as Mag<[u64; 12]>>::Mag<MAG2>>,
+    FpWide<MAG1, VARTIME>: Ops<1, [u64; 12], MAG2>,
+    <FpWide<MAG1, VARTIME> as OtherMag>::Mag<MAG2>: Mag<1, [u64; 12]>,
+    for<'j> &'j FpWide<MAG2, VARTIME>: Into<&'j <FpWide<MAG1, VARTIME> as OtherMag>::Mag<MAG2>>,
 {
-    type Output = <FpWide<MAG1> as Ops<[u64; 12], MAG2>>::OpOut;
+    type Output = <FpWide<MAG1, VARTIME> as Ops<1, [u64; 12], MAG2>>::OpOut;
 
     #[inline(always)]
-    fn sub(self, rhs: &'b FpWide<MAG2>) -> Self::Output {
+    fn sub(self, rhs: &'b FpWide<MAG2, VARTIME>) -> Self::Output {
         Ops::sub(self, rhs.into())
     }
 }
 
 impl_binops_additive_output! {
-{const MAG1: usize, const MAG2: usize}
-{where FpWide<MAG1>: Ops<[u64; 12], MAG2>, <FpWide<MAG1> as Mag<[u64; 12]>>::Mag<MAG2>: Mag<[u64; 12]>, for<'j> &'j FpWide<MAG2>: Into<&'j <FpWide<MAG1> as Mag<[u64; 12]>>::Mag<MAG2>>}
-{FpWide<MAG1>}
-{FpWide<MAG2>}}
+{const MAG1: usize, const MAG2: usize, const VARTIME: bool}
+{where FpWide<MAG1, VARTIME>: Ops<1, [u64; 12], MAG2>, <FpWide<MAG1, VARTIME> as OtherMag>::Mag<MAG2>: Mag<1, [u64; 12]>, for<'j> &'j FpWide<MAG2, VARTIME>: Into<&'j <FpWide<MAG1, VARTIME> as OtherMag>::Mag<MAG2>>}
+{FpWide<MAG1, VARTIME>}
+{FpWide<MAG2, VARTIME>}}
 
 macro_rules! wide_double_impl {
 ($($($ua:literal),+ $(,)?)?) => {$($(
-impl FpWide<$ua> {
+impl<const VARTIME: bool> FpWide<$ua, VARTIME> {
     #[inline(always)]
-    pub fn double(&self) -> FpWide<{$ua*2 + 1}> {
-        FpWide(double_wide(&self.0))
+    pub const fn double(&self) -> FpWide<{$ua*2 + 1}, VARTIME> {
+        FpWide(double_wide(&self.0, 1))
     }
 }
 )+)?};
@@ -503,10 +718,26 @@ mod test {
         v[0] -= 1 + (rng.next_u64() & (1024 - 1));
         Fp(v)
     }
+    #[test]
+    fn test_sub() {
+        use rand_core::SeedableRng;
+        let mut rng = rand_xorshift::XorShiftRng::from_seed([
+            0x57, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
+            0xbc, 0xe5,
+        ]);
+        for _ in 0..1_000_000 {
+            let a = gen_big(&mut rng);
+            let b = gen_big(&mut rng);
+            let c = gen_big(&mut rng);
+            let d = gen_big(&mut rng);
+            let a_ur = a.mul_unreduced(&b);
+            let b_ur = c.mul_unreduced(&d);
 
+            let _ = a_ur - b_ur;
+        }
+    }
     #[test]
     fn test_depth() {
-        const VARTIME: bool = true;
         use rand_core::SeedableRng;
         let mut rng = rand_xorshift::XorShiftRng::from_seed([
             0x57, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
@@ -520,42 +751,42 @@ mod test {
             let v = a * b;
             let v_ur = a.mul_unreduced(&b);
 
-            let v_5 = v.double::<VARTIME>().double::<VARTIME>() + v;
+            let v_5 = v.double().double() + v;
             let v_5_ur = v_ur.double().double() + v_ur;
-            assert_eq!(v_5.0, v_5_ur.montgomery_reduce::<false>().0);
+            assert_eq!(v_5.0, v_5_ur.montgomery_reduce_full().0);
 
-            let v_10 = v_5.double::<VARTIME>();
+            let v_10 = v_5.double();
             let v_10_ur = v_5_ur + v_5_ur;
-            assert_eq!(v_10.0, v_10_ur.montgomery_reduce::<VARTIME>().0, "{}", i);
+            assert_eq!(v_10.0, v_10_ur.montgomery_reduce_full().0, "{}", i);
 
-            let v = v.double::<VARTIME>() + v;
+            let v = v.double() + v;
             let v_ur = v_ur.double() + v_ur;
-            assert_eq!(v.0, v_ur.montgomery_reduce::<VARTIME>().0);
+            assert_eq!(v.0, v_ur.montgomery_reduce_full().0);
 
-            let v = v.double::<VARTIME>();
+            let v = v.double();
             let v_ur = v_ur.double();
-            assert_eq!(v.0, v_ur.montgomery_reduce::<VARTIME>().0);
+            assert_eq!(v.0, v_ur.montgomery_reduce_full().0);
 
-            let v = v.double::<VARTIME>();
+            let v = v.double();
             let v_ur = v_ur.double();
-            assert_eq!(v.0, v_ur.montgomery_reduce::<VARTIME>().0);
+            assert_eq!(v.0, v_ur.montgomery_reduce_full().0);
 
-            let v = v.double::<VARTIME>();
+            let v = v.double();
             let v_ur = v_ur.double();
-            assert_eq!(v.0, v_ur.montgomery_reduce::<VARTIME>().0);
+            assert_eq!(v.0, v_ur.montgomery_reduce_full().0);
 
-            let v = v.double::<VARTIME>();
+            let v = v.double();
             let v_ur = v_ur.double();
-            assert_eq!(v.0, v_ur.montgomery_reduce::<VARTIME>().0);
+            assert_eq!(v.0, v_ur.montgomery_reduce_full().0);
 
-            let v = v_10.double::<VARTIME>().double::<VARTIME>();
+            let v = v_10.double().double();
             let v_ur = v_10_ur.double().double();
-            assert_eq!(v.0, v_ur.montgomery_reduce::<VARTIME>().0);
+            assert_eq!(v.0, v_ur.montgomery_reduce_full().0);
 
-            let v = v.double::<VARTIME>() + v_5;
+            let v = v.double() + v_5;
             let v_ur: FpWide<84> = v_ur.double() + v_5_ur;
-            assert_eq!(v, v_ur.montgomery_reduce::<VARTIME>(), "{}", i);
-            assert_eq!(v.0, v_ur.montgomery_reduce::<VARTIME>().0, "{}", i);
+            assert_eq!(v, v_ur.montgomery_reduce_full(), "{}", i);
+            assert_eq!(v.0, v_ur.montgomery_reduce_full().0, "{}", i);
         }
     }
 
@@ -570,7 +801,7 @@ mod test {
         for _ in 0..(1000 * 1000) {
             let v = gen_big(&mut rng).mul_unreduced(&gen_big(&mut rng));
 
-            assert_eq!(double_wide(&v.0), add_wide(&v.0, &v.0))
+            assert_eq!(double_wide(&v.0, 1), add_wide(&v.0, &v.0))
         }
     }
 
@@ -582,11 +813,11 @@ mod test {
             0xbc, 0xe5,
         ]);
         for _ in 0..32 {
-            let [a, b, c, d] = [(); 4].map(|_| Fp::random(&mut rng));
+            let [a, b, c, d] = [(); 4].map(|_| Fp::<0, false>::random(&mut rng));
 
             assert_eq!(
                 a * b + c * d,
-                (a.mul_unreduced(&b) + c.mul_unreduced(&d)).montgomery_reduce::<false>()
+                (a.mul_unreduced(&b) + c.mul_unreduced(&d)).montgomery_reduce_full()
             );
         }
 
@@ -622,8 +853,8 @@ mod test {
             let mut items = items.into_iter().map(|(v, _)| v);
             let total = items.next().unwrap();
             let total: Fp = items.fold(total, |total, v| total + v);
-            assert_eq!(total.0, total_ur.montgomery_reduce::<false>().0);
-            assert_eq!(total, total_ur.montgomery_reduce::<false>());
+            assert_eq!(total.0, total_ur.montgomery_reduce_full().0);
+            assert_eq!(total, total_ur.montgomery_reduce_full());
         }
     }
 }

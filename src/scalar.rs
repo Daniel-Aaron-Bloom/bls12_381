@@ -11,7 +11,106 @@ use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 #[cfg(feature = "bits")]
 use ff::{FieldBits, PrimeFieldBits};
 
-use crate::util::{adc, mac, sbb};
+use crate::util::{adc, mac, sbb, borrowing_sub, slc, OtherMag, Mag, Never, NonZero, Ops, DoubleOp};
+
+use self::wide::{square_wide, montgomery_reduce_wide, mul_wide};
+
+mod wide;
+
+#[inline]
+const fn negate(v: &[u64; 4], modulus: &[u64; 4]) -> [u64; 4] {
+    let (d0, borrow) = borrowing_sub(modulus[0], v[0], false);
+    let (d1, borrow) = borrowing_sub(modulus[1], v[1], borrow);
+    let (d2, borrow) = borrowing_sub(modulus[2], v[2], borrow);
+    let (d3, _borrow) = borrowing_sub(modulus[3], v[3], borrow);
+
+    if cfg!(debug_assertions) && _borrow {
+        panic!("borrow != 0");
+    }
+    
+    [d0, d1, d2, d3]
+}
+
+#[inline]
+const fn add(lhs: &[u64; 4], rhs: &[u64; 4]) -> ([u64; 4], bool) {
+    let (d0, carry) = adc(lhs[0], rhs[0], 0);
+    let (d1, carry) = adc(lhs[1], rhs[1], carry);
+    let (d2, carry) = adc(lhs[2], rhs[2], carry);
+    let (d3, carry) = adc(lhs[3], rhs[3], carry);
+
+    ([d0, d1, d2, d3], carry != 0)
+}
+
+#[inline]
+const fn sub<const VARTIME: bool>(lhs: &[u64; 4], rhs: &[u64; 4], mut modulus: [u64; 4]) -> [u64; 4] {
+    let (r0, borrow) = borrowing_sub(lhs[0], rhs[0], false);
+    let (r1, borrow) = borrowing_sub(lhs[1], rhs[1], borrow);
+    let (r2, borrow) = borrowing_sub(lhs[2], rhs[2], borrow);
+    let (r3, borrow) = borrowing_sub(lhs[3], rhs[3], borrow);
+
+    let v = [r0, r1, r2, r3];
+    match VARTIME {
+        true if borrow => add(&v, &modulus).0,
+        true => v,
+        false => {
+            // If underflow occurred on the final limb, borrow = 0xfff...fff, otherwise
+            // borrow = 0x000...000. Thus, we use it as a mask!
+            let borrow = -(borrow as i64) as u64;
+            modulus[0] &= borrow;
+            modulus[1] &= borrow;
+            modulus[2] &= borrow;
+            modulus[3] &= borrow;
+            add(&v, &modulus).0
+        }
+    }
+}
+#[inline]
+const fn double(v: &[u64; 4], pow: u32) -> ([u64; 4], bool) {
+    let (d0, carry) = slc(v[0], pow, 0);
+    let (d1, carry) = slc(v[1], pow, carry);
+    let (d2, carry) = slc(v[2], pow, carry);
+    let (d3, carry) = slc(v[3], pow, carry);
+    
+    ([d0, d1, d2, d3], carry != 0)
+}
+
+#[inline]
+const fn montgomery_reduce<const MAGNITUDE: usize, const VARTIME: bool>(lhs: &[u64; 4]) -> [u64; 4] {
+    let mut new = [0; 8];
+    new[0] = lhs[0];
+    new[1] = lhs[1];
+    new[2] = lhs[2];
+    new[3] = lhs[3];
+    let (mut v, msb) = wide::montgomery_reduce_wide(&new);
+    if MAGNITUDE > 0 {
+        v = subtract_p::<VARTIME>(msb, &v, &MODULUS.0)
+    }
+    v
+}
+
+#[inline]
+const fn subtract_p<const VARTIME: bool>(msb: bool, v: &[u64; 4], modulus: &[u64; 4]) -> [u64; 4] {
+    let (r0, borrow) = borrowing_sub(v[0], modulus[0], false);
+    let (r1, borrow) = borrowing_sub(v[1], modulus[1], borrow);
+    let (r2, borrow) = borrowing_sub(v[2], modulus[2], borrow);
+    let (r3, borrow) = borrowing_sub(v[3], modulus[3], borrow);
+
+    match VARTIME {
+        true if borrow > msb => *v,
+        true => [r0, r1, r2, r3],
+        false => {
+            // If underflow occurred on the final limb, borrow = 0xfff...fff, otherwise
+            // borrow = 0x000...000. Thus, we use it as a mask!
+            let borrow = -(borrow as i64) as u64;
+            [
+                (v[0] & borrow) | (r0 & !borrow),
+                (v[1] & borrow) | (r1 & !borrow),
+                (v[2] & borrow) | (r2 & !borrow),
+                (v[3] & borrow) | (r3 & !borrow),
+            ]
+        }
+    }
+}
 
 /// Represents an element of the scalar field $\mathbb{F}_q$ of the BLS12-381 elliptic
 /// curve construction.
@@ -19,9 +118,110 @@ use crate::util::{adc, mac, sbb};
 // integers in little-endian order. `Scalar` values are always in
 // Montgomery form; i.e., Scalar(a) = aR mod q, with R = 2^256.
 #[derive(Clone, Copy, Eq)]
-pub struct Scalar(pub(crate) [u64; 4]);
+pub struct Scalar<const MAGNITUDE: usize = 0, const VARTIME: bool = false>(pub(crate) [u64; 4]);
 
-impl fmt::Debug for Scalar {
+
+impl<const MAGNITUDE: usize, const VARTIME: bool> OtherMag for Scalar<MAGNITUDE, VARTIME> {
+    type Mag<const MAG2: usize> = Scalar<MAG2, VARTIME>;
+}
+
+impl<const VARTIME: bool> Mag<1, [u64; 4]> for Scalar<0, VARTIME> {
+    type Prev = Never;
+    type Next = Scalar<1, VARTIME>;
+
+    /// A multiple of the prime that is larger than this element could be (p).
+    const MODULUS: [u64; 4] = MODULUS.0;
+
+    #[inline(always)]
+    fn make([v]: [[u64; 4]; 1]) -> Self {
+        Self(v)
+    }
+    #[inline(always)]
+    fn data(&self) -> [&[u64; 4]; 1] {
+        [&self.0]
+    }
+    #[inline(always)]
+    fn negate(&self) -> Self {
+        self.neg()
+    }
+}
+
+impl<const VARTIME: bool> Mag<1, [u64; 4]> for Scalar<1, VARTIME> {
+    type Prev = Scalar<0, VARTIME>;
+    type Next = Never;
+
+    /// A multiple of the prime that is larger than this element could be (p).
+    const MODULUS: [u64; 4] = add(&Self::Prev::MODULUS, &MODULUS.0).0;
+
+    #[inline(always)]
+    fn make([v]: [[u64; 4]; 1]) -> Self {
+        Self(v)
+    }
+    #[inline(always)]
+    fn data(&self) -> [&[u64; 4]; 1] {
+        [&self.0]
+    }
+    #[inline(always)]
+    fn negate(&self) -> Self {
+        self.neg()
+    }
+
+}
+impl<const VARTIME: bool> NonZero for Scalar<1, VARTIME> {}
+
+
+impl<const MAG2: usize, const VARTIME: bool> Ops<1, [u64; 4], MAG2> for Scalar<0, VARTIME>
+where
+    Scalar<MAG2, VARTIME>: Mag<1, [u64; 4]>,
+{
+    type OpOut = <Scalar<MAG2, VARTIME> as Mag<1, [u64; 4]>>::Next;
+    #[inline(always)]
+    fn add(lhs: &Self, rhs: &Scalar<MAG2, VARTIME>) -> Self::OpOut {
+        Mag::make([add(&lhs.0, &rhs.0).0])
+    }
+    #[inline(always)]
+    fn sub(lhs: &Self, rhs: &Scalar<MAG2, VARTIME>) -> Self::OpOut {
+        Mag::make([sub::<VARTIME>(&lhs.0, &rhs.0, <Self::OpOut>::MODULUS)])
+    }
+}
+
+impl<const MAG1: usize, const MAG2: usize, const VARTIME: bool> Ops<1, [u64; 4], MAG2> for Scalar<MAG1, VARTIME>
+where
+    Scalar<MAG1, VARTIME>: Mag<1, [u64; 4]> + NonZero,
+    <Scalar<MAG1, VARTIME> as Mag<1, [u64; 4]>>::Prev: Ops<1, [u64; 4], MAG2>,
+    Scalar<MAG2, VARTIME>: Mag<1, [u64; 4]>,
+{
+    type OpOut =
+        <<<Scalar<MAG1, VARTIME> as Mag<1, [u64; 4]>>::Prev as Ops<1, [u64; 4], MAG2>>::OpOut as Mag<1, [u64; 4]>>::Next;
+    #[inline(always)]
+    fn add(lhs: &Self, rhs: &Self::Mag<MAG2>) -> Self::OpOut
+    where
+        Self::Mag<MAG2>: Mag<1, [u64; 4]>,
+    {
+        Mag::make([add(lhs.data()[0], rhs.data()[0]).0])
+    }
+    #[inline(always)]
+    fn sub(lhs: &Self, rhs: &Self::Mag<MAG2>) -> Self::OpOut
+    where
+        Self::Mag<MAG2>: Mag<1, [u64; 4]>,
+    {
+        Mag::make([sub::<VARTIME>(&lhs.0, &rhs.data()[0], <Self::OpOut>::MODULUS)])
+    }
+}
+
+macro_rules! impl_double {
+    ($pow:literal: $($($ua:literal),+ $(,)?)?) => {$($(
+impl<const VARTIME: bool> DoubleOp<$pow> for Scalar<$ua, VARTIME> {
+    type DoubleOut = Scalar<{($ua+1)*(1<<($pow+1))-1}, VARTIME>;
+    fn double(lhs: &Self) -> Self::DoubleOut {
+        Scalar(double(&lhs.0, $pow+1).0)
+    }
+}
+    )+)?};
+}
+impl_double!{0: 0}
+
+impl<const MAGNITUDE: usize, const VARTIME: bool> fmt::Debug for Scalar<MAGNITUDE, VARTIME> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let tmp = self.to_bytes();
         write!(f, "0x")?;
@@ -32,19 +232,19 @@ impl fmt::Debug for Scalar {
     }
 }
 
-impl fmt::Display for Scalar {
+impl<const MAGNITUDE: usize, const VARTIME: bool> fmt::Display for Scalar<MAGNITUDE, VARTIME> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:?}", self)
     }
 }
 
-impl From<u64> for Scalar {
-    fn from(val: u64) -> Scalar {
-        Scalar([val, 0, 0, 0]) * R2
+impl<const MAGNITUDE: usize, const VARTIME: bool> From<u64> for Scalar<MAGNITUDE, VARTIME> {
+    fn from(val: u64) -> Self {
+        Self([val, 0, 0, 0]).mul(&Self(R2.0))
     }
 }
 
-impl ConstantTimeEq for Scalar {
+impl<const MAGNITUDE: usize, const VARTIME: bool> ConstantTimeEq for Scalar<MAGNITUDE, VARTIME> {
     fn ct_eq(&self, other: &Self) -> Choice {
         self.0[0].ct_eq(&other.0[0])
             & self.0[1].ct_eq(&other.0[1])
@@ -53,14 +253,17 @@ impl ConstantTimeEq for Scalar {
     }
 }
 
-impl PartialEq for Scalar {
+impl<const MAGNITUDE: usize, const VARTIME: bool> PartialEq for Scalar<MAGNITUDE, VARTIME> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        bool::from(self.ct_eq(other))
+        match VARTIME {
+            true => self.0 == other.0,
+            false => bool::from(self.ct_eq(other)),
+        }
     }
 }
 
-impl ConditionallySelectable for Scalar {
+impl<const MAGNITUDE: usize, const VARTIME: bool> ConditionallySelectable for Scalar<MAGNITUDE, VARTIME> {
     fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
         Scalar([
             u64::conditional_select(&a.0[0], &b.0[0], choice),
@@ -104,53 +307,63 @@ const GENERATOR: Scalar = Scalar([
     0x3513_3220_8fc5_a8c4,
 ]);
 
-impl<'a> Neg for &'a Scalar {
-    type Output = Scalar;
+impl<'a, const MAGNITUDE: usize, const VARTIME: bool> Neg for &'a Scalar<MAGNITUDE, VARTIME> {
+    type Output = Scalar<MAGNITUDE, VARTIME>;
 
     #[inline]
-    fn neg(self) -> Scalar {
+    fn neg(self) -> Scalar<MAGNITUDE, VARTIME> {
         self.neg()
     }
 }
 
-impl Neg for Scalar {
-    type Output = Scalar;
+impl<const MAGNITUDE: usize, const VARTIME: bool> Neg for Scalar<MAGNITUDE, VARTIME> {
+    type Output = Self;
 
     #[inline]
-    fn neg(self) -> Scalar {
+    fn neg(self) -> Self {
         -&self
     }
 }
 
-impl<'a, 'b> Sub<&'b Scalar> for &'a Scalar {
-    type Output = Scalar;
+impl<'a, 'b, const MAGNITUDE: usize, const VARTIME: bool> Sub<&'b Scalar<MAGNITUDE, VARTIME>> for &'a Scalar<MAGNITUDE, VARTIME> {
+    type Output = Scalar<MAGNITUDE, VARTIME>;
 
     #[inline]
-    fn sub(self, rhs: &'b Scalar) -> Scalar {
+    fn sub(self, rhs: &'b Scalar<MAGNITUDE, VARTIME>) -> Scalar<MAGNITUDE, VARTIME> {
         self.sub(rhs)
     }
 }
 
-impl<'a, 'b> Add<&'b Scalar> for &'a Scalar {
-    type Output = Scalar;
+impl<'a, 'b, const MAGNITUDE: usize, const VARTIME: bool> Add<&'b Scalar<MAGNITUDE, VARTIME>> for &'a Scalar<MAGNITUDE, VARTIME> {
+    type Output = Scalar<MAGNITUDE, VARTIME>;
 
     #[inline]
-    fn add(self, rhs: &'b Scalar) -> Scalar {
+    fn add(self, rhs: &'b Scalar<MAGNITUDE, VARTIME>) -> Scalar<MAGNITUDE, VARTIME> {
         self.add(rhs)
     }
 }
 
-impl<'a, 'b> Mul<&'b Scalar> for &'a Scalar {
-    type Output = Scalar;
+impl<'a, 'b, const MAGNITUDE: usize, const VARTIME: bool> Mul<&'b Scalar<MAGNITUDE, VARTIME>> for &'a Scalar<MAGNITUDE, VARTIME> {
+    type Output = Scalar<MAGNITUDE, VARTIME>;
 
     #[inline]
-    fn mul(self, rhs: &'b Scalar) -> Scalar {
+    fn mul(self, rhs: &'b Scalar<MAGNITUDE, VARTIME>) -> Scalar<MAGNITUDE, VARTIME> {
         self.mul(rhs)
     }
 }
 
-impl_binops_additive!(Scalar, Scalar);
-impl_binops_multiplicative!(Scalar, Scalar);
+impl_binops_additive!{
+    {const VARTIME: bool}
+    {}
+    {Scalar<0, VARTIME>}
+    {Scalar<0, VARTIME>}
+}
+impl_binops_multiplicative!{
+    {const VARTIME: bool}
+    {}
+    {Scalar<0, VARTIME>}
+    {Scalar<0, VARTIME>}
+}
 
 /// INV = -(q^{-1} mod 2^64) mod 2^64
 const INV: u64 = 0xffff_fffe_ffff_ffff;
@@ -196,7 +409,7 @@ const ROOT_OF_UNITY: Scalar = Scalar([
     0x5bf3_adda_19e9_b27b,
 ]);
 
-impl Default for Scalar {
+impl<const MAGNITUDE: usize, const VARTIME: bool> Default for Scalar<MAGNITUDE, VARTIME> {
     #[inline]
     fn default() -> Self {
         Self::zero()
@@ -204,32 +417,219 @@ impl Default for Scalar {
 }
 
 #[cfg(feature = "zeroize")]
-impl zeroize::DefaultIsZeroes for Scalar {}
+impl<const MAGNITUDE: usize, const VARTIME: bool> zeroize::DefaultIsZeroes for Scalar<MAGNITUDE, VARTIME> {}
 
-impl Scalar {
+impl<const MAGNITUDE: usize, const VARTIME: bool> Scalar<MAGNITUDE, VARTIME> {
     /// Returns zero, the additive identity.
     #[inline]
-    pub const fn zero() -> Scalar {
+    pub const fn zero() -> Self {
         Scalar([0, 0, 0, 0])
     }
 
     /// Returns one, the multiplicative identity.
     #[inline]
-    pub const fn one() -> Scalar {
-        R
+    pub const fn one() -> Self {
+        Self(R.0)
+    }
+
+    /// An integer `s` satisfying the equation `2^s * t = modulus - 1` with `t` odd.
+    ///
+    /// This is the number of leading zero bits in the little-endian bit representation of
+    /// `modulus - 1`.
+    pub const S: u32 = S;
+
+    /// Returns the `2^S` root of unity.
+    pub const fn root_of_unity() -> Self {
+        Self(ROOT_OF_UNITY.0)
+    }
+
+    /// Returns the `2^bits` root of unity.
+    pub fn omega(bits: u32) -> Self {
+        // The pairing-friendly curve may not be able to support
+        // large enough (radix2) evaluation domains.
+        if bits >= Self::S {
+            panic!("unsupported root of unity")
+        }
+
+        // Compute omega, the 2^exp primitive root of unity
+        Self::root_of_unity().pow_vartime(&[1 << (Self::S - bits), 0, 0, 0])
+    }
+
+    /// Adjusts the `VARTIME` setting
+    #[inline]
+    pub const fn vartime<const VARTIME2: bool>(self) -> Scalar<MAGNITUDE, VARTIME2> {
+        Scalar(self.0)
+    }
+
+    #[inline]
+    /// Returns true if equal
+    pub const fn eq_vartime(&self, rhs: &Self) -> bool {
+        self.0[0] == rhs.0[0]
+            && self.0[1] == rhs.0[1]
+            && self.0[2] == rhs.0[2]
+            && self.0[3] == rhs.0[3]
+    }
+
+    #[inline]
+    /// Returns a choice which is true if `self` is zero
+    pub fn is_zero(&self) -> Choice {
+        self.ct_eq(&Self::zero())
+    }
+
+    #[inline]
+    /// Returns a `true` if `self` is zero
+    pub const fn is_zero_vartime(&self) -> bool {
+        self.eq_vartime(&Self::zero())
+    }
+
+    #[inline(always)]
+    pub(crate) const fn montgomery_reduce(&self) -> [u64; 4] {
+        montgomery_reduce::<MAGNITUDE, VARTIME>(&self.0)
+    }
+
+    /// Converts an element of `Scalar` into a byte representation in
+    /// little-endian byte order.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        // Turn into canonical form by computing
+        // (a.R) / R = a
+        let tmp = self.montgomery_reduce();
+
+        let mut res = [0; 32];
+        res[0..8].copy_from_slice(&tmp[0].to_le_bytes());
+        res[8..16].copy_from_slice(&tmp[1].to_le_bytes());
+        res[16..24].copy_from_slice(&tmp[2].to_le_bytes());
+        res[24..32].copy_from_slice(&tmp[3].to_le_bytes());
+
+        res
+    }
+
+    /// Negates `self`.
+    #[inline]
+    pub const fn neg(&self) -> Self {
+        match VARTIME {
+            true if self.is_zero_vartime() => *self,
+            true => Self(negate(&self.0, &MODULUS.0)),
+            false => {
+                // Let's use a mask if `self` was zero, which would mean
+                // the result of the subtraction is p.
+                let mask = (((self.0[0] | self.0[1] | self.0[2] | self.0[3]) == 0)
+                as u64)
+                .wrapping_sub(1);
+
+                let v = negate(&self.0, &MODULUS.0);
+                Self([
+                    v[0] & mask,
+                    v[1] & mask,
+                    v[2] & mask,
+                    v[3] & mask,
+                ])
+            }
+        }
+    }
+
+    /// Adds `rhs` to `self`, returning the result.
+    #[inline]
+    pub const fn add(&self, rhs: &Self) -> Self {
+        let (v, carry) = add(&self.0, &rhs.0);
+
+        // Attempt to subtract the modulus, to ensure the value
+        // is smaller than the modulus.
+        Self(subtract_p::<VARTIME>(carry, &v, &MODULUS.0))
+    }
+
+    /// Subtracts `rhs` from `self`, returning the result.
+    #[inline]
+    pub const fn sub(&self, rhs: &Self) -> Self {
+        Self(sub::<VARTIME>(&self.0, &rhs.0, MODULUS.0))
     }
 
     /// Doubles this field element.
     #[inline]
-    pub const fn double(&self) -> Scalar {
-        // TODO: This can be achieved more efficiently with a bitshift.
-        self.add(self)
+    pub const fn double(&self) -> Self {
+        let (v, carry) = double(&self.0, 1);
+
+        // Attempt to subtract the modulus, to ensure the value
+        // is smaller than the modulus.
+        Self(subtract_p::<VARTIME>(carry, &v, &MODULUS.0))
+    }
+
+    /// Squares this element.
+    #[inline]
+    pub const fn square(&self) -> Self {
+        let mut v = montgomery_reduce_wide(&square_wide(&self.0)).0;
+        
+        // $Solve[b=((m*p)^2 + 2^256*p - p)/2^256/p && m = 1 && p = 52435875175126190479447740508185965837690552500527637822603658699938581184513, b]$
+        // We can see that `montgomery_reduce_wide` will produce results with an upper bound of $p + 0.45285 * m*p$
+        // This means we actually only have to reduce the item in two cases
+        match MAGNITUDE {
+            0 => v = subtract_p::<VARTIME>(false, &v, &<Scalar<0, false> as Mag<1, _>>::MODULUS),
+            1 => v = subtract_p::<VARTIME>(false, &v, &<Scalar<1, false> as Mag<1, _>>::MODULUS),
+            _ => {},
+        }
+        Self(v)
+    }
+
+    /// Multiplies `rhs` by `self`, returning the result.
+    #[inline]
+    pub const fn mul(&self, rhs: &Self) -> Self {
+        let mut v = montgomery_reduce_wide(&mul_wide(&self.0, &rhs.0)).0;
+        
+        // $Solve[b=((m*p)^2 + 2^256*p - p)/2^256/p && m = 1 && p = 52435875175126190479447740508185965837690552500527637822603658699938581184513, b]$
+        // We can see that `montgomery_reduce_wide` will produce results with an upper bound of $p + 0.45285 * m*p$
+        // This means we actually only have to reduce the item in two cases
+        match MAGNITUDE {
+            0 => v = subtract_p::<VARTIME>(false, &v, &<Scalar<0, false> as Mag<1, _>>::MODULUS),
+            1 => v = subtract_p::<VARTIME>(false, &v, &<Scalar<1, false> as Mag<1, _>>::MODULUS),
+            _ => {},
+        }
+        Self(v)
+    }
+
+    /// Exponentiates `self` by `by`, where `by` is a
+    /// little-endian order integer exponent.
+    pub fn pow(&self, by: &[u64; 4]) -> Self {
+        let mut res = Self::one();
+        for e in by.iter().rev() {
+            for i in (0..64).rev() {
+                res = res.square();
+                let tmp = res.mul(self);
+                res.conditional_assign(&tmp, (((*e >> i) & 0x1) as u8).into());
+            }
+        }
+        res
+    }
+
+    /// Exponentiates `self` by `by`, where `by` is a
+    /// little-endian order integer exponent.
+    ///
+    /// **This operation is variable time with respect
+    /// to the exponent.** If the exponent is fixed,
+    /// this operation is effectively constant time.
+    pub const fn pow_vartime(&self, by: &[u64; 4]) -> Self {
+        let mut res = Self::one();
+        // for e in by.iter().rev() {
+        let mut e_i = by.len();
+        while e_i > 0 {
+            e_i -= 1;
+            let e = &by[e_i];
+            // for i in (0..64).rev() {
+            let mut i = 64;
+            while i > 0 {
+                i -= 1;
+                res = res.square();
+
+                if ((*e >> i) & 1) == 1 {
+                    res = res.mul(self);
+                }
+            }
+        }
+        res
     }
 
     /// Attempts to convert a little-endian byte representation of
     /// a scalar into a `Scalar`, failing if the input is not canonical.
-    pub fn from_bytes(bytes: &[u8; 32]) -> CtOption<Scalar> {
-        let mut tmp = Scalar([0, 0, 0, 0]);
+    pub fn from_bytes(bytes: &[u8; 32]) -> CtOption<Self> {
+        let mut tmp = Self([0, 0, 0, 0]);
 
         tmp.0[0] = u64::from_le_bytes(<[u8; 8]>::try_from(&bytes[0..8]).unwrap());
         tmp.0[1] = u64::from_le_bytes(<[u8; 8]>::try_from(&bytes[8..16]).unwrap());
@@ -249,31 +649,15 @@ impl Scalar {
 
         // Convert to Montgomery form by computing
         // (a.R^0 * R^2) / R = a.R
-        tmp *= &R2;
+        tmp = tmp.mul(&Self(R2.0));
 
         CtOption::new(tmp, Choice::from(is_some))
     }
 
-    /// Converts an element of `Scalar` into a byte representation in
-    /// little-endian byte order.
-    pub fn to_bytes(&self) -> [u8; 32] {
-        // Turn into canonical form by computing
-        // (a.R) / R = a
-        let tmp = Scalar::montgomery_reduce(self.0[0], self.0[1], self.0[2], self.0[3], 0, 0, 0, 0);
-
-        let mut res = [0; 32];
-        res[0..8].copy_from_slice(&tmp.0[0].to_le_bytes());
-        res[8..16].copy_from_slice(&tmp.0[1].to_le_bytes());
-        res[16..24].copy_from_slice(&tmp.0[2].to_le_bytes());
-        res[24..32].copy_from_slice(&tmp.0[3].to_le_bytes());
-
-        res
-    }
-
     /// Converts a 512-bit little endian integer into
     /// a `Scalar` by reducing by the modulus.
-    pub fn from_bytes_wide(bytes: &[u8; 64]) -> Scalar {
-        Scalar::from_u512([
+    pub fn from_bytes_wide(bytes: &[u8; 64]) -> Self {
+        Self::from_u512([
             u64::from_le_bytes(<[u8; 8]>::try_from(&bytes[0..8]).unwrap()),
             u64::from_le_bytes(<[u8; 8]>::try_from(&bytes[8..16]).unwrap()),
             u64::from_le_bytes(<[u8; 8]>::try_from(&bytes[16..24]).unwrap()),
@@ -285,7 +669,7 @@ impl Scalar {
         ])
     }
 
-    fn from_u512(limbs: [u64; 8]) -> Scalar {
+    const fn from_u512(limbs: [u64; 8]) -> Self {
         // We reduce an arbitrary 512-bit number by decomposing it into two 256-bit digits
         // with the higher bits multiplied by 2^256. Thus, we perform two reductions
         //
@@ -299,48 +683,16 @@ impl Scalar {
         // that (2^256 - 1)*c is an acceptable product for the reduction. Therefore, the
         // reduction always works so long as `c` is in the field; in this case it is either the
         // constant `R2` or `R3`.
-        let d0 = Scalar([limbs[0], limbs[1], limbs[2], limbs[3]]);
-        let d1 = Scalar([limbs[4], limbs[5], limbs[6], limbs[7]]);
+        let d0 = Self([limbs[0], limbs[1], limbs[2], limbs[3]]);
+        let d1 = Self([limbs[4], limbs[5], limbs[6], limbs[7]]);
         // Convert to Montgomery form
-        d0 * R2 + d1 * R3
+        d0.mul(&Self(R2.0)).add(&d1.mul(&Self(R3.0)))
     }
 
     /// Converts from an integer represented in little endian
     /// into its (congruent) `Scalar` representation.
     pub const fn from_raw(val: [u64; 4]) -> Self {
-        (&Scalar(val)).mul(&R2)
-    }
-
-    /// Squares this element.
-    #[inline]
-    pub const fn square(&self) -> Scalar {
-        let (r1, carry) = mac(0, self.0[0], self.0[1], 0);
-        let (r2, carry) = mac(0, self.0[0], self.0[2], carry);
-        let (r3, r4) = mac(0, self.0[0], self.0[3], carry);
-
-        let (r3, carry) = mac(r3, self.0[1], self.0[2], 0);
-        let (r4, r5) = mac(r4, self.0[1], self.0[3], carry);
-
-        let (r5, r6) = mac(r5, self.0[2], self.0[3], 0);
-
-        let r7 = r6 >> 63;
-        let r6 = (r6 << 1) | (r5 >> 63);
-        let r5 = (r5 << 1) | (r4 >> 63);
-        let r4 = (r4 << 1) | (r3 >> 63);
-        let r3 = (r3 << 1) | (r2 >> 63);
-        let r2 = (r2 << 1) | (r1 >> 63);
-        let r1 = r1 << 1;
-
-        let (r0, carry) = mac(0, self.0[0], self.0[0], 0);
-        let (r1, carry) = adc(0, r1, carry);
-        let (r2, carry) = mac(r2, self.0[1], self.0[1], carry);
-        let (r3, carry) = adc(0, r3, carry);
-        let (r4, carry) = mac(r4, self.0[2], self.0[2], carry);
-        let (r5, carry) = adc(0, r5, carry);
-        let (r6, carry) = mac(r6, self.0[3], self.0[3], carry);
-        let (r7, _) = adc(0, r7, carry);
-
-        Scalar::montgomery_reduce(r0, r1, r2, r3, r4, r5, r6, r7)
+        (&Scalar(val)).mul(&Self(R2.0))
     }
 
     /// Computes the square root of this element, if it exists.
@@ -358,11 +710,11 @@ impl Scalar {
         ]);
 
         let mut v = S;
-        let mut x = self * w;
-        let mut b = x * w;
+        let mut x = self.mul(&w);
+        let mut b = x.mul(&w);
 
         // Initialize z as the 2^S root of unity.
-        let mut z = ROOT_OF_UNITY;
+        let mut z = Self(ROOT_OF_UNITY.0);
 
         for max_v in (1..=S).rev() {
             let mut k = 1;
@@ -379,275 +731,116 @@ impl Scalar {
                 z = Scalar::conditional_select(&z, &new_z, j_less_than_v);
             }
 
-            let result = x * z;
+            let result = x.mul(&z);
             x = Scalar::conditional_select(&result, &x, b.ct_eq(&Scalar::one()));
             z = z.square();
-            b *= z;
+            b = b.mul(&z);
             v = k;
         }
 
         CtOption::new(
             x,
-            (x * x).ct_eq(self), // Only return Some if it's the square root.
+            x.square().ct_eq(self), // Only return Some if it's the square root.
         )
-    }
-
-    /// Exponentiates `self` by `by`, where `by` is a
-    /// little-endian order integer exponent.
-    pub fn pow(&self, by: &[u64; 4]) -> Self {
-        let mut res = Self::one();
-        for e in by.iter().rev() {
-            for i in (0..64).rev() {
-                res = res.square();
-                let mut tmp = res;
-                tmp *= self;
-                res.conditional_assign(&tmp, (((*e >> i) & 0x1) as u8).into());
-            }
-        }
-        res
-    }
-
-    /// Exponentiates `self` by `by`, where `by` is a
-    /// little-endian order integer exponent.
-    ///
-    /// **This operation is variable time with respect
-    /// to the exponent.** If the exponent is fixed,
-    /// this operation is effectively constant time.
-    pub fn pow_vartime(&self, by: &[u64; 4]) -> Self {
-        let mut res = Self::one();
-        for e in by.iter().rev() {
-            for i in (0..64).rev() {
-                res = res.square();
-
-                if ((*e >> i) & 1) == 1 {
-                    res.mul_assign(self);
-                }
-            }
-        }
-        res
     }
 
     /// Computes the multiplicative inverse of this element,
     /// failing if the element is zero.
     pub fn invert(&self) -> CtOption<Self> {
         #[inline(always)]
-        fn square_assign_multi(n: &mut Scalar, num_times: usize) {
+        fn square_assign_multi<const MAGNITUDE: usize, const VARTIME: bool>(n: &mut Scalar<MAGNITUDE, VARTIME>, num_times: usize) {
             for _ in 0..num_times {
                 *n = n.square();
             }
         }
         // found using https://github.com/kwantam/addchain
         let mut t0 = self.square();
-        let mut t1 = t0 * self;
+        let mut t1 = t0.mul(self);
         let mut t16 = t0.square();
         let mut t6 = t16.square();
-        let mut t5 = t6 * t0;
-        t0 = t6 * t16;
-        let mut t12 = t5 * t16;
+        let mut t5 = t6.mul(&t0);
+        t0 = t6.mul(&t16);
+        let mut t12 = t5.mul(&t16);
         let mut t2 = t6.square();
-        let mut t7 = t5 * t6;
-        let mut t15 = t0 * t5;
+        let mut t7 = t5.mul(&t6);
+        let mut t15 = t0.mul(&t5);
         let mut t17 = t12.square();
-        t1 *= t17;
-        let mut t3 = t7 * t2;
-        let t8 = t1 * t17;
-        let t4 = t8 * t2;
-        let t9 = t8 * t7;
-        t7 = t4 * t5;
-        let t11 = t4 * t17;
-        t5 = t9 * t17;
-        let t14 = t7 * t15;
-        let t13 = t11 * t12;
-        t12 = t11 * t17;
-        t15 *= &t12;
-        t16 *= &t15;
-        t3 *= &t16;
-        t17 *= &t3;
-        t0 *= &t17;
-        t6 *= &t0;
-        t2 *= &t6;
+        t1 = t1.mul(&t17);
+        let mut t3 = t7.mul(&t2);
+        let t8 = t1.mul(&t17);
+        let t4 = t8.mul(&t2);
+        let t9 = t8.mul(&t7);
+        t7 = t4.mul(&t5);
+        let t11 = t4.mul(&t17);
+        t5 = t9.mul(&t17);
+        let t14 = t7.mul(&t15);
+        let t13 = t11.mul(&t12);
+        t12 = t11.mul(&t17);
+        t15 = t15.mul(&t12);
+        t16 = t16.mul(&t15);
+        t3 = t3.mul(&t16);
+        t17 = t17.mul(&t3);
+        t0 = t0.mul(&t17);
+        t6 = t6.mul(&t0);
+        t2 = t2.mul(&t6);
         square_assign_multi(&mut t0, 8);
-        t0 *= &t17;
+        t0 = t0.mul(&t17);
         square_assign_multi(&mut t0, 9);
-        t0 *= &t16;
+        t0 = t0.mul(&t16);
         square_assign_multi(&mut t0, 9);
-        t0 *= &t15;
+        t0 = t0.mul(&t15);
         square_assign_multi(&mut t0, 9);
-        t0 *= &t15;
+        t0 = t0.mul(&t15);
         square_assign_multi(&mut t0, 7);
-        t0 *= &t14;
+        t0 = t0.mul(&t14);
         square_assign_multi(&mut t0, 7);
-        t0 *= &t13;
+        t0 = t0.mul(&t13);
         square_assign_multi(&mut t0, 10);
-        t0 *= &t12;
+        t0 = t0.mul(&t12);
         square_assign_multi(&mut t0, 9);
-        t0 *= &t11;
+        t0 = t0.mul(&t11);
         square_assign_multi(&mut t0, 8);
-        t0 *= &t8;
+        t0 = t0.mul(&t8);
         square_assign_multi(&mut t0, 8);
-        t0 *= self;
+        t0 = t0.mul(self);
         square_assign_multi(&mut t0, 14);
-        t0 *= &t9;
+        t0 = t0.mul(&t9);
         square_assign_multi(&mut t0, 10);
-        t0 *= &t8;
+        t0 = t0.mul(&t8);
         square_assign_multi(&mut t0, 15);
-        t0 *= &t7;
+        t0 = t0.mul(&t7);
         square_assign_multi(&mut t0, 10);
-        t0 *= &t6;
+        t0 = t0.mul(&t6);
         square_assign_multi(&mut t0, 8);
-        t0 *= &t5;
+        t0 = t0.mul(&t5);
         square_assign_multi(&mut t0, 16);
-        t0 *= &t3;
+        t0 = t0.mul(&t3);
         square_assign_multi(&mut t0, 8);
-        t0 *= &t2;
+        t0 = t0.mul(&t2);
         square_assign_multi(&mut t0, 7);
-        t0 *= &t4;
+        t0 = t0.mul(&t4);
         square_assign_multi(&mut t0, 9);
-        t0 *= &t2;
+        t0 = t0.mul(&t2);
         square_assign_multi(&mut t0, 8);
-        t0 *= &t3;
+        t0 = t0.mul(&t3);
         square_assign_multi(&mut t0, 8);
-        t0 *= &t2;
+        t0 = t0.mul(&t2);
         square_assign_multi(&mut t0, 8);
-        t0 *= &t2;
+        t0 = t0.mul(&t2);
         square_assign_multi(&mut t0, 8);
-        t0 *= &t2;
+        t0 = t0.mul(&t2);
         square_assign_multi(&mut t0, 8);
-        t0 *= &t3;
+        t0 = t0.mul(&t3);
         square_assign_multi(&mut t0, 8);
-        t0 *= &t2;
+        t0 = t0.mul(&t2);
         square_assign_multi(&mut t0, 8);
-        t0 *= &t2;
+        t0 = t0.mul(&t2);
         square_assign_multi(&mut t0, 5);
-        t0 *= &t1;
+        t0 = t0.mul(&t1);
         square_assign_multi(&mut t0, 5);
-        t0 *= &t1;
+        t0 = t0.mul(&t1);
 
         CtOption::new(t0, !self.ct_eq(&Self::zero()))
-    }
-
-    #[inline(always)]
-    const fn montgomery_reduce(
-        r0: u64,
-        r1: u64,
-        r2: u64,
-        r3: u64,
-        r4: u64,
-        r5: u64,
-        r6: u64,
-        r7: u64,
-    ) -> Self {
-        // The Montgomery reduction here is based on Algorithm 14.32 in
-        // Handbook of Applied Cryptography
-        // <http://cacr.uwaterloo.ca/hac/about/chap14.pdf>.
-
-        let k = r0.wrapping_mul(INV);
-        let (_, carry) = mac(r0, k, MODULUS.0[0], 0);
-        let (r1, carry) = mac(r1, k, MODULUS.0[1], carry);
-        let (r2, carry) = mac(r2, k, MODULUS.0[2], carry);
-        let (r3, carry) = mac(r3, k, MODULUS.0[3], carry);
-        let (r4, carry2) = adc(r4, 0, carry);
-
-        let k = r1.wrapping_mul(INV);
-        let (_, carry) = mac(r1, k, MODULUS.0[0], 0);
-        let (r2, carry) = mac(r2, k, MODULUS.0[1], carry);
-        let (r3, carry) = mac(r3, k, MODULUS.0[2], carry);
-        let (r4, carry) = mac(r4, k, MODULUS.0[3], carry);
-        let (r5, carry2) = adc(r5, carry2, carry);
-
-        let k = r2.wrapping_mul(INV);
-        let (_, carry) = mac(r2, k, MODULUS.0[0], 0);
-        let (r3, carry) = mac(r3, k, MODULUS.0[1], carry);
-        let (r4, carry) = mac(r4, k, MODULUS.0[2], carry);
-        let (r5, carry) = mac(r5, k, MODULUS.0[3], carry);
-        let (r6, carry2) = adc(r6, carry2, carry);
-
-        let k = r3.wrapping_mul(INV);
-        let (_, carry) = mac(r3, k, MODULUS.0[0], 0);
-        let (r4, carry) = mac(r4, k, MODULUS.0[1], carry);
-        let (r5, carry) = mac(r5, k, MODULUS.0[2], carry);
-        let (r6, carry) = mac(r6, k, MODULUS.0[3], carry);
-        let (r7, _) = adc(r7, carry2, carry);
-
-        // Result may be within MODULUS of the correct value
-        (&Scalar([r4, r5, r6, r7])).sub(&MODULUS)
-    }
-
-    /// Multiplies `rhs` by `self`, returning the result.
-    #[inline]
-    pub const fn mul(&self, rhs: &Self) -> Self {
-        // Schoolbook multiplication
-
-        let (r0, carry) = mac(0, self.0[0], rhs.0[0], 0);
-        let (r1, carry) = mac(0, self.0[0], rhs.0[1], carry);
-        let (r2, carry) = mac(0, self.0[0], rhs.0[2], carry);
-        let (r3, r4) = mac(0, self.0[0], rhs.0[3], carry);
-
-        let (r1, carry) = mac(r1, self.0[1], rhs.0[0], 0);
-        let (r2, carry) = mac(r2, self.0[1], rhs.0[1], carry);
-        let (r3, carry) = mac(r3, self.0[1], rhs.0[2], carry);
-        let (r4, r5) = mac(r4, self.0[1], rhs.0[3], carry);
-
-        let (r2, carry) = mac(r2, self.0[2], rhs.0[0], 0);
-        let (r3, carry) = mac(r3, self.0[2], rhs.0[1], carry);
-        let (r4, carry) = mac(r4, self.0[2], rhs.0[2], carry);
-        let (r5, r6) = mac(r5, self.0[2], rhs.0[3], carry);
-
-        let (r3, carry) = mac(r3, self.0[3], rhs.0[0], 0);
-        let (r4, carry) = mac(r4, self.0[3], rhs.0[1], carry);
-        let (r5, carry) = mac(r5, self.0[3], rhs.0[2], carry);
-        let (r6, r7) = mac(r6, self.0[3], rhs.0[3], carry);
-
-        Scalar::montgomery_reduce(r0, r1, r2, r3, r4, r5, r6, r7)
-    }
-
-    /// Subtracts `rhs` from `self`, returning the result.
-    #[inline]
-    pub const fn sub(&self, rhs: &Self) -> Self {
-        let (d0, borrow) = sbb(self.0[0], rhs.0[0], 0);
-        let (d1, borrow) = sbb(self.0[1], rhs.0[1], borrow);
-        let (d2, borrow) = sbb(self.0[2], rhs.0[2], borrow);
-        let (d3, borrow) = sbb(self.0[3], rhs.0[3], borrow);
-
-        // If underflow occurred on the final limb, borrow = 0xfff...fff, otherwise
-        // borrow = 0x000...000. Thus, we use it as a mask to conditionally add the modulus.
-        let (d0, carry) = adc(d0, MODULUS.0[0] & borrow, 0);
-        let (d1, carry) = adc(d1, MODULUS.0[1] & borrow, carry);
-        let (d2, carry) = adc(d2, MODULUS.0[2] & borrow, carry);
-        let (d3, _) = adc(d3, MODULUS.0[3] & borrow, carry);
-
-        Scalar([d0, d1, d2, d3])
-    }
-
-    /// Adds `rhs` to `self`, returning the result.
-    #[inline]
-    pub const fn add(&self, rhs: &Self) -> Self {
-        let (d0, carry) = adc(self.0[0], rhs.0[0], 0);
-        let (d1, carry) = adc(self.0[1], rhs.0[1], carry);
-        let (d2, carry) = adc(self.0[2], rhs.0[2], carry);
-        let (d3, _) = adc(self.0[3], rhs.0[3], carry);
-
-        // Attempt to subtract the modulus, to ensure the value
-        // is smaller than the modulus.
-        (&Scalar([d0, d1, d2, d3])).sub(&MODULUS)
-    }
-
-    /// Negates `self`.
-    #[inline]
-    pub const fn neg(&self) -> Self {
-        // Subtract `self` from `MODULUS` to negate. Ignore the final
-        // borrow because it cannot underflow; self is guaranteed to
-        // be in the field.
-        let (d0, borrow) = sbb(MODULUS.0[0], self.0[0], 0);
-        let (d1, borrow) = sbb(MODULUS.0[1], self.0[1], borrow);
-        let (d2, borrow) = sbb(MODULUS.0[2], self.0[2], borrow);
-        let (d3, _) = sbb(MODULUS.0[3], self.0[3], borrow);
-
-        // `tmp` could be `MODULUS` if `self` was zero. Create a mask that is
-        // zero if `self` was zero, and `u64::max_value()` if self was nonzero.
-        let mask = (((self.0[0] | self.0[1] | self.0[2] | self.0[3]) == 0) as u64).wrapping_sub(1);
-
-        Scalar([d0 & mask, d1 & mask, d2 & mask, d3 & mask])
     }
 }
 
@@ -663,7 +856,7 @@ impl<'a> From<&'a Scalar> for [u8; 32] {
     }
 }
 
-impl Field for Scalar {
+impl<const VARTIME: bool> Field for Scalar<0, VARTIME> {
     fn random(mut rng: impl RngCore) -> Self {
         let mut buf = [0; 64];
         rng.fill_bytes(&mut buf);
@@ -701,7 +894,7 @@ impl Field for Scalar {
     }
 }
 
-impl PrimeField for Scalar {
+impl<const VARTIME: bool> PrimeField for Scalar<0, VARTIME> {
     type Repr = [u8; 32];
 
     fn from_repr(r: Self::Repr) -> CtOption<Self> {
@@ -720,13 +913,13 @@ impl PrimeField for Scalar {
     const CAPACITY: u32 = Self::NUM_BITS - 1;
 
     fn multiplicative_generator() -> Self {
-        GENERATOR
+        GENERATOR.vartime()
     }
 
     const S: u32 = S;
 
     fn root_of_unity() -> Self {
-        ROOT_OF_UNITY
+        ROOT_OF_UNITY.vartime()
     }
 }
 
@@ -737,7 +930,7 @@ type ReprBits = [u32; 8];
 type ReprBits = [u64; 4];
 
 #[cfg(feature = "bits")]
-impl PrimeFieldBits for Scalar {
+impl<const VARTIME: bool> PrimeFieldBits for Scalar<0, VARTIME> {
     type ReprBits = ReprBits;
 
     fn to_le_bits(&self) -> FieldBits<Self::ReprBits> {
@@ -777,15 +970,15 @@ impl PrimeFieldBits for Scalar {
     }
 }
 
-impl<T> core::iter::Sum<T> for Scalar
+impl<T, const MAGNITUDE: usize, const VARTIME: bool> core::iter::Sum<T> for Scalar<MAGNITUDE, VARTIME>
 where
-    T: core::borrow::Borrow<Scalar>,
+    T: core::borrow::Borrow<Scalar<MAGNITUDE, VARTIME>>,
 {
     fn sum<I>(iter: I) -> Self
     where
         I: Iterator<Item = T>,
     {
-        iter.fold(Self::zero(), |acc, item| acc + item.borrow())
+        iter.fold(Self::zero(), |acc, item| acc.add(item.borrow()))
     }
 }
 
@@ -823,18 +1016,18 @@ fn test_debug() {
 
 #[test]
 fn test_equality() {
-    assert_eq!(Scalar::zero(), Scalar::zero());
-    assert_eq!(Scalar::one(), Scalar::one());
+    assert_eq!(Scalar::<0, false>::zero(), Scalar::zero());
+    assert_eq!(Scalar::<0, false>::one(), Scalar::one());
     assert_eq!(R2, R2);
 
-    assert!(Scalar::zero() != Scalar::one());
-    assert!(Scalar::one() != R2);
+    assert!(Scalar::<0, false>::zero() != Scalar::one());
+    assert!(Scalar::<0, false>::one() != R2);
 }
 
 #[test]
 fn test_to_bytes() {
     assert_eq!(
-        Scalar::zero().to_bytes(),
+        Scalar::<0, false>::zero().to_bytes(),
         [
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0
@@ -842,7 +1035,7 @@ fn test_to_bytes() {
     );
 
     assert_eq!(
-        Scalar::one().to_bytes(),
+        Scalar::<0, false>::one().to_bytes(),
         [
             1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0
@@ -858,7 +1051,7 @@ fn test_to_bytes() {
     );
 
     assert_eq!(
-        (-&Scalar::one()).to_bytes(),
+        (-&Scalar::<0, false>::one()).to_bytes(),
         [
             0, 0, 0, 0, 255, 255, 255, 255, 254, 91, 254, 255, 2, 164, 189, 83, 5, 216, 161, 9, 8,
             216, 57, 51, 72, 125, 157, 41, 83, 167, 237, 115
@@ -869,7 +1062,7 @@ fn test_to_bytes() {
 #[test]
 fn test_from_bytes() {
     assert_eq!(
-        Scalar::from_bytes(&[
+        Scalar::<0, false>::from_bytes(&[
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0
         ])
@@ -878,7 +1071,7 @@ fn test_from_bytes() {
     );
 
     assert_eq!(
-        Scalar::from_bytes(&[
+        Scalar::<0, false>::from_bytes(&[
             1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0
         ])
@@ -887,7 +1080,7 @@ fn test_from_bytes() {
     );
 
     assert_eq!(
-        Scalar::from_bytes(&[
+        Scalar::<0, false>::from_bytes(&[
             254, 255, 255, 255, 1, 0, 0, 0, 2, 72, 3, 0, 250, 183, 132, 88, 245, 79, 188, 236, 239,
             79, 140, 153, 111, 5, 197, 172, 89, 177, 36, 24
         ])
@@ -897,7 +1090,7 @@ fn test_from_bytes() {
 
     // -1 should work
     assert!(bool::from(
-        Scalar::from_bytes(&[
+        Scalar::<0, false>::from_bytes(&[
             0, 0, 0, 0, 255, 255, 255, 255, 254, 91, 254, 255, 2, 164, 189, 83, 5, 216, 161, 9, 8,
             216, 57, 51, 72, 125, 157, 41, 83, 167, 237, 115
         ])
@@ -906,7 +1099,7 @@ fn test_from_bytes() {
 
     // modulus is invalid
     assert!(bool::from(
-        Scalar::from_bytes(&[
+        Scalar::<0, false>::from_bytes(&[
             1, 0, 0, 0, 255, 255, 255, 255, 254, 91, 254, 255, 2, 164, 189, 83, 5, 216, 161, 9, 8,
             216, 57, 51, 72, 125, 157, 41, 83, 167, 237, 115
         ])
@@ -915,21 +1108,21 @@ fn test_from_bytes() {
 
     // Anything larger than the modulus is invalid
     assert!(bool::from(
-        Scalar::from_bytes(&[
+        Scalar::<0, false>::from_bytes(&[
             2, 0, 0, 0, 255, 255, 255, 255, 254, 91, 254, 255, 2, 164, 189, 83, 5, 216, 161, 9, 8,
             216, 57, 51, 72, 125, 157, 41, 83, 167, 237, 115
         ])
         .is_none()
     ));
     assert!(bool::from(
-        Scalar::from_bytes(&[
+        Scalar::<0, false>::from_bytes(&[
             1, 0, 0, 0, 255, 255, 255, 255, 254, 91, 254, 255, 2, 164, 189, 83, 5, 216, 161, 9, 8,
             216, 58, 51, 72, 125, 157, 41, 83, 167, 237, 115
         ])
         .is_none()
     ));
     assert!(bool::from(
-        Scalar::from_bytes(&[
+        Scalar::<0, false>::from_bytes(&[
             1, 0, 0, 0, 255, 255, 255, 255, 254, 91, 254, 255, 2, 164, 189, 83, 5, 216, 161, 9, 8,
             216, 57, 51, 72, 125, 157, 41, 83, 167, 237, 116
         ])
@@ -940,7 +1133,7 @@ fn test_from_bytes() {
 #[test]
 fn test_from_u512_zero() {
     assert_eq!(
-        Scalar::zero(),
+        Scalar::<0, false>::zero(),
         Scalar::from_u512([
             MODULUS.0[0],
             MODULUS.0[1],
@@ -988,7 +1181,7 @@ fn test_from_bytes_wide_r2() {
 #[test]
 fn test_from_bytes_wide_negative_one() {
     assert_eq!(
-        -&Scalar::one(),
+        -&Scalar::<0, false>::one(),
         Scalar::from_bytes_wide(&[
             0, 0, 0, 0, 255, 255, 255, 255, 254, 91, 254, 255, 2, 164, 189, 83, 5, 216, 161, 9, 8,
             216, 57, 51, 72, 125, 157, 41, 83, 167, 237, 115, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -1000,7 +1193,7 @@ fn test_from_bytes_wide_negative_one() {
 #[test]
 fn test_from_bytes_wide_maximum() {
     assert_eq!(
-        Scalar([
+        Scalar::<0, false>([
             0xc62c_1805_439b_73b1,
             0xc2b9_551e_8ced_218e,
             0xda44_ec81_daf9_a422,
@@ -1012,10 +1205,10 @@ fn test_from_bytes_wide_maximum() {
 
 #[test]
 fn test_zero() {
-    assert_eq!(Scalar::zero(), -&Scalar::zero());
-    assert_eq!(Scalar::zero(), Scalar::zero() + Scalar::zero());
-    assert_eq!(Scalar::zero(), Scalar::zero() - Scalar::zero());
-    assert_eq!(Scalar::zero(), Scalar::zero() * Scalar::zero());
+    assert_eq!(Scalar::<0, false>::zero(), -&Scalar::zero());
+    assert_eq!(Scalar::<0, false>::zero(), Scalar::zero() + Scalar::zero());
+    assert_eq!(Scalar::<0, false>::zero(), Scalar::zero() - Scalar::zero());
+    assert_eq!(Scalar::<0, false>::zero(), Scalar::zero() * Scalar::zero());
 }
 
 #[cfg(test)]
@@ -1053,7 +1246,7 @@ fn test_negation() {
 
     assert_eq!(tmp, Scalar([1, 0, 0, 0]));
 
-    let tmp = -&Scalar::zero();
+    let tmp: Scalar = -&Scalar::zero();
     assert_eq!(tmp, Scalar::zero());
     let tmp = -&Scalar([1, 0, 0, 0]);
     assert_eq!(tmp, LARGEST);
@@ -1135,9 +1328,9 @@ fn test_squaring() {
 
 #[test]
 fn test_inversion() {
-    assert!(bool::from(Scalar::zero().invert().is_none()));
-    assert_eq!(Scalar::one().invert().unwrap(), Scalar::one());
-    assert_eq!((-&Scalar::one()).invert().unwrap(), -&Scalar::one());
+    assert!(bool::from(Scalar::<0, false>::zero().invert().is_none()));
+    assert_eq!(Scalar::<0, false>::one().invert().unwrap(), Scalar::one());
+    assert_eq!((-&Scalar::<0, false>::one()).invert().unwrap(), -&Scalar::one());
 
     let mut tmp = R2;
 
@@ -1181,10 +1374,10 @@ fn test_invert_is_pow() {
 #[test]
 fn test_sqrt() {
     {
-        assert_eq!(Scalar::zero().sqrt().unwrap(), Scalar::zero());
+        assert_eq!(Scalar::<0, false>::zero().sqrt().unwrap(), Scalar::zero());
     }
 
-    let mut square = Scalar([
+    let mut square: Scalar = Scalar([
         0x46cd_85a5_f273_077e,
         0x1d30_c47d_d68f_c735,
         0x77f6_56f6_0bec_a0eb,
@@ -1209,7 +1402,7 @@ fn test_sqrt() {
 #[test]
 fn test_from_raw() {
     assert_eq!(
-        Scalar::from_raw([
+        Scalar::<0, false>::from_raw([
             0x0001_ffff_fffd,
             0x5884_b7fa_0003_4802,
             0x998c_4fef_ecbc_4ff5,
@@ -1218,14 +1411,14 @@ fn test_from_raw() {
         Scalar::from_raw([0xffff_ffff_ffff_ffff; 4])
     );
 
-    assert_eq!(Scalar::from_raw(MODULUS.0), Scalar::zero());
+    assert_eq!(Scalar::<0, false>::from_raw(MODULUS.0), Scalar::zero());
 
     assert_eq!(Scalar::from_raw([1, 0, 0, 0]), R);
 }
 
 #[test]
 fn test_double() {
-    let a = Scalar::from_raw([
+    let a: Scalar = Scalar::from_raw([
         0x1fff_3231_233f_fffd,
         0x4884_b7fa_0003_4802,
         0x998c_4fef_ecbc_4ff3,

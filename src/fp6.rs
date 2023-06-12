@@ -112,7 +112,7 @@ impl Fp6 {
 
     pub fn mul_by_1<const VARTIME: bool>(&self, c1: &Fp2) -> Fp6 {
         Fp6 {
-            c0: (self.c2 * c1).mul_by_nonresidue::<VARTIME>(),
+            c0: (self.c2 * c1).mul_by_nonresidue(),
             c1: self.c0 * c1,
             c2: self.c1 * c1,
         }
@@ -122,7 +122,7 @@ impl Fp6 {
         let a_a = self.c0 * c0;
         let b_b = self.c1 * c1;
 
-        let t1 = (self.c2 * c1).mul_by_nonresidue::<VARTIME>() + a_a;
+        let t1 = (self.c2 * c1).mul_by_nonresidue() + a_a;
 
         let t2 = (c0 + c1) * (self.c0 + self.c1) - a_a - b_b;
 
@@ -143,7 +143,7 @@ impl Fp6 {
         //     c(u + 1) + av + v^2
 
         Fp6 {
-            c0: self.c2.mul_by_nonresidue::<VARTIME>(),
+            c0: self.c2.mul_by_nonresidue(),
             c1: self.c0,
             c2: self.c1,
         }
@@ -152,9 +152,9 @@ impl Fp6 {
     /// Raises this element to p.
     #[inline(always)]
     pub fn frobenius_map<const VARTIME: bool>(&self) -> Self {
-        let c0 = self.c0.frobenius_map::<VARTIME>();
-        let c1 = self.c1.frobenius_map::<VARTIME>();
-        let c2 = self.c2.frobenius_map::<VARTIME>();
+        let c0 = self.c0.frobenius_map();
+        let c1 = self.c1.frobenius_map();
+        let c2 = self.c2.frobenius_map();
 
         // c1 = c1 * (u + 1)^((p - 1) / 3)
         let c1 = c1
@@ -195,9 +195,9 @@ impl Fp6 {
     #[inline]
     pub fn neg<const VARTIME: bool>(&self) -> Self {
         Fp6 {
-            c0: (&self.c0).neg::<VARTIME>(),
-            c1: (&self.c1).neg::<VARTIME>(),
-            c2: (&self.c2).neg::<VARTIME>(),
+            c0: (&self.c0).neg(),
+            c1: (&self.c1).neg(),
+            c2: (&self.c2).neg(),
         }
     }
 
@@ -250,31 +250,31 @@ impl Fp6 {
 
         Fp6 {
             c0: Fp2 {
-                c0: Fp::sum_of_products::<6, VARTIME>(
+                c0: Fp::sum_of_products(
                     [a.c0.c0, -a.c0.c1, a.c1.c0, -a.c1.c1, a.c2.c0, -a.c2.c1],
                     [b.c0.c0, b.c0.c1, b20_m_b21, b20_p_b21, b10_m_b11, b10_p_b11],
                 ),
-                c1: Fp::sum_of_products::<6, VARTIME>(
+                c1: Fp::sum_of_products(
                     [a.c0.c0, a.c0.c1, a.c1.c0, a.c1.c1, a.c2.c0, a.c2.c1],
                     [b.c0.c1, b.c0.c0, b20_p_b21, b20_m_b21, b10_p_b11, b10_m_b11],
                 ),
             },
             c1: Fp2 {
-                c0: Fp::sum_of_products::<6, VARTIME>(
+                c0: Fp::sum_of_products(
                     [a.c0.c0, -a.c0.c1, a.c1.c0, -a.c1.c1, a.c2.c0, -a.c2.c1],
                     [b.c1.c0, b.c1.c1, b.c0.c0, b.c0.c1, b20_m_b21, b20_p_b21],
                 ),
-                c1: Fp::sum_of_products::<6, VARTIME>(
+                c1: Fp::sum_of_products(
                     [a.c0.c0, a.c0.c1, a.c1.c0, a.c1.c1, a.c2.c0, a.c2.c1],
                     [b.c1.c1, b.c1.c0, b.c0.c1, b.c0.c0, b20_p_b21, b20_m_b21],
                 ),
             },
             c2: Fp2 {
-                c0: Fp::sum_of_products::<6, VARTIME>(
+                c0: Fp::sum_of_products(
                     [a.c0.c0, -a.c0.c1, a.c1.c0, -a.c1.c1, a.c2.c0, -a.c2.c1],
                     [b.c2.c0, b.c2.c1, b.c1.c0, b.c1.c1, b.c0.c0, b.c0.c1],
                 ),
-                c1: Fp::sum_of_products::<6, VARTIME>(
+                c1: Fp::sum_of_products(
                     [a.c0.c0, a.c0.c1, a.c1.c0, a.c1.c1, a.c2.c0, a.c2.c1],
                     [b.c2.c1, b.c2.c0, b.c1.c1, b.c1.c0, b.c0.c1, b.c0.c0],
                 ),
@@ -284,33 +284,33 @@ impl Fp6 {
 
     #[inline]
     pub fn square<const VARTIME: bool>(&self) -> Self {
-        let s0 = self.c0.square::<VARTIME>();
+        let s0 = self.c0.square();
         let ab = self.c0 * self.c1;
         let s1 = ab + ab;
-        let s2 = (self.c0 - self.c1 + self.c2).square::<VARTIME>();
+        let s2 = (self.c0 - self.c1 + self.c2).square();
         let bc = self.c1 * self.c2;
         let s3 = bc + bc;
-        let s4 = self.c2.square::<VARTIME>();
+        let s4 = self.c2.square();
 
         Fp6 {
-            c0: s3.mul_by_nonresidue::<VARTIME>() + s0,
-            c1: s4.mul_by_nonresidue::<VARTIME>() + s1,
+            c0: s3.mul_by_nonresidue() + s0,
+            c1: s4.mul_by_nonresidue() + s1,
             c2: s1 + s2 + s3 - s0 - s4,
         }
     }
 
     #[inline]
     pub fn invert(&self) -> CtOption<Self> {
-        let c0 = (self.c1 * self.c2).mul_by_nonresidue::<false>();
-        let c0 = self.c0.square::<false>() - c0;
+        let c0 = (self.c1 * self.c2).mul_by_nonresidue();
+        let c0 = self.c0.square() - c0;
 
-        let c1 = self.c2.square::<false>().mul_by_nonresidue::<false>();
+        let c1 = self.c2.square().mul_by_nonresidue();
         let c1 = c1 - (self.c0 * self.c1);
 
-        let c2 = self.c1.square::<false>();
+        let c2 = self.c1.square();
         let c2 = c2 - (self.c0 * self.c2);
 
-        let tmp = ((self.c1 * c2) + (self.c2 * c1)).mul_by_nonresidue::<false>();
+        let tmp = ((self.c1 * c2) + (self.c2 * c1)).mul_by_nonresidue();
         let tmp = tmp + (self.c0 * c0);
 
         tmp.invert().map(|t| Fp6 {

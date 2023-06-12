@@ -2,7 +2,7 @@
 extern crate criterion;
 
 extern crate bls12_381;
-use bls12_381::*;
+use bls12_381::{*, fp::Fp};
 
 use criterion::{black_box, Criterion};
 
@@ -32,7 +32,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     // G1Affine
     {
         let name = "G1Affine";
-        let a = G1Affine::generator();
+        let a = G1Affine::<VARTIME>::generator();
         let s = Scalar::from_raw([1, 2, 3, 4]);
         let compressed = [0u8; 48];
         let uncompressed = [0u8; 96];
@@ -43,7 +43,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             b.iter(|| black_box(a) == black_box(a))
         });
         c.bench_function(&format!("{} scalar multiplication", name), move |b| {
-            b.iter(|| black_box(a).mul::<VARTIME>(black_box(&s)))
+            b.iter(|| black_box(a).mul(black_box(&s)))
         });
         c.bench_function(&format!("{} subgroup check", name), move |b| {
             b.iter(|| black_box(a).is_torsion_free())
@@ -61,13 +61,13 @@ fn criterion_benchmark(c: &mut Criterion) {
     // G1Projective
     {
         let name = "G1Projective";
-        let a = G1Projective::generator();
+        let a = G1Projective::<VARTIME>::generator();
         let a_affine = G1Affine::generator();
         let s = Scalar::from_raw([1, 2, 3, 4]);
 
         const N: usize = 10000;
-        let v = vec![G1Projective::generator(); N];
-        let mut q = vec![G1Affine::identity(); N];
+        let v = vec![G1Projective::<VARTIME>::generator(); N];
+        let mut q = vec![G1Affine::<VARTIME>::identity(); N];
 
         c.bench_function(&format!("{} check on curve", name), move |b| {
             b.iter(|| black_box(a).is_on_curve())
@@ -79,16 +79,16 @@ fn criterion_benchmark(c: &mut Criterion) {
             b.iter(|| G1Affine::from(black_box(a)))
         });
         c.bench_function(&format!("{} doubling", name), move |b| {
-            b.iter(|| black_box(a).double::<VARTIME>())
+            b.iter(|| black_box(a).double())
         });
         c.bench_function(&format!("{} addition", name), move |b| {
-            b.iter(|| black_box(a).add::<VARTIME>(&a))
+            b.iter(|| black_box(a).add(&a))
         });
         c.bench_function(&format!("{} mixed addition", name), move |b| {
-            b.iter(|| black_box(a).add_mixed::<VARTIME>(&a_affine))
+            b.iter(|| black_box(a).add_mixed(&a_affine))
         });
         c.bench_function(&format!("{} scalar multiplication", name), move |b| {
-            b.iter(|| black_box(a).mul::<VARTIME>(black_box(&s)))
+            b.iter(|| black_box(a).mul(black_box(&s)))
         });
         c.bench_function(&format!("{} batch to affine n={}", name, N), move |b| {
             b.iter(|| {
@@ -164,6 +164,21 @@ fn criterion_benchmark(c: &mut Criterion) {
                 G2Projective::batch_normalize(black_box(&v), black_box(&mut q));
                 black_box(&q)[0]
             })
+        });
+    }
+
+    // Fp
+    {
+        let name = "Fp";
+        use rand_core::SeedableRng;
+        let mut rng = rand_xorshift::XorShiftRng::from_seed([
+            0x57, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
+            0xbc, 0xe5,
+        ]);
+        let a = Fp::<0, true>::random(&mut rng);
+
+        c.bench_function(&format!("{} sqrt", name), move |b| {
+            b.iter(|| black_box(a).sqrt_vartime())
         });
     }
 }

@@ -193,7 +193,7 @@ const B: Fp2 = Fp2 {
     ]),
 };
 
-const B3: Fp2 = Fp2::add::<false>(&Fp2::add::<false>(&B, &B), &B);
+const B3: Fp2 = Fp2::add(&Fp2::add(&B, &B), &B);
 
 impl G2Affine {
     /// Returns the identity of the group: the point at infinity.
@@ -251,7 +251,7 @@ impl G2Affine {
 
     /// Multiplies this point by a scalar.
     #[inline]
-    pub fn mul<const VARTIME: bool>(self, other: &Scalar) -> G2Projective {
+    pub fn mul<const VARTIME: bool>(self, other: &Scalar<0, VARTIME>) -> G2Projective {
         G2Projective::from(self).mul::<VARTIME>(other)
     }
 
@@ -446,7 +446,7 @@ impl G2Affine {
                 )
                 .or_else(|| {
                     // Recover a y-coordinate given x by y = sqrt(x^3 + 4)
-                    ((x.square::<false>() * x) + B).sqrt().and_then(|y| {
+                    ((x.square() * x) + B).sqrt().and_then(|y| {
                         // Switch to the correct y-coordinate if necessary.
                         let y = Fp2::conditional_select(
                             &y,
@@ -491,7 +491,7 @@ impl G2Affine {
     /// true unless an "unchecked" API was used.
     pub fn is_on_curve(&self) -> Choice {
         // y^2 - x^3 ?= 4(u + 1)
-        (self.y.square::<false>() - (self.x.square::<false>() * self.x)).ct_eq(&B) | self.infinity
+        (self.y.square() - (self.x.square() * self.x)).ct_eq(&B) | self.infinity
     }
 }
 
@@ -715,12 +715,12 @@ impl G2Projective {
     pub fn double<const VARTIME: bool>(&self) -> G2Projective {
         // Algorithm 9, https://eprint.iacr.org/2015/1060.pdf
 
-        let t0 = self.y.square::<VARTIME>();
+        let t0 = self.y.square();
         let z3 = t0 + t0;
         let z3 = z3 + z3;
         let z3 = z3 + z3;
         let t1 = self.y * self.z;
-        let t2 = self.z.square::<VARTIME>();
+        let t2 = self.z.square();
         let t2 = mul_by_3b(t2);
         let x3 = t2 * z3;
         let y3 = t0 + t2;
@@ -838,7 +838,7 @@ impl G2Projective {
 
     /// Multiplies this point by a scalar.
     #[inline]
-    pub fn mul<const VARTIME: bool>(self, other: &Scalar) -> G2Projective {
+    pub fn mul<const VARTIME: bool>(self, other: &Scalar<0, VARTIME>) -> G2Projective {
         self.multiply::<VARTIME>(&other.to_bytes())
     }
 
@@ -905,11 +905,11 @@ impl G2Projective {
 
         G2Projective {
             // x = frobenius(x)/((u+1)^((p-1)/3))
-            x: self.x.frobenius_map::<VARTIME>() * psi_coeff_x,
+            x: self.x.frobenius_map() * psi_coeff_x,
             // y = frobenius(y)/(u+1)^((p-1)/2)
-            y: self.y.frobenius_map::<VARTIME>() * psi_coeff_y,
+            y: self.y.frobenius_map() * psi_coeff_y,
             // z = frobenius(z)
-            z: self.z.frobenius_map::<VARTIME>(),
+            z: self.z.frobenius_map(),
         }
     }
 
@@ -1026,7 +1026,7 @@ impl G2Projective {
     pub fn is_on_curve(&self) -> Choice {
         // Y^2 Z = X^3 + b Z^3
 
-        (self.y.square::<false>() * self.z).ct_eq(&(self.x.square::<false>() * self.x + self.z.square::<false>() * self.z * B))
+        (self.y.square() * self.z).ct_eq(&(self.x.square() * self.x + self.z.square() * self.z * B))
             | self.z.is_zero()
     }
 }
@@ -1128,7 +1128,7 @@ impl Group for G2Projective {
             let flip_sign = rng.next_u32() % 2 != 0;
 
             // Obtain the corresponding y-coordinate given x as y = sqrt(x^3 + 4)
-            let p = ((x.square::<false>() * x) + B).sqrt().map(|y| G2Affine {
+            let p = ((x.square() * x) + B).sqrt().map(|y| G2Affine {
                 x,
                 y: if flip_sign { -y } else { y },
                 infinity: 0.into(),
@@ -1612,7 +1612,7 @@ fn test_projective_addition() {
             ]),
             c1: Fp::zero(),
         };
-        let beta = beta.square::<false>();
+        let beta = beta.square();
         let a = G2Projective::generator().double::<false>().double::<false>();
         let b = G2Projective {
             x: a.x * beta,
@@ -1776,7 +1776,7 @@ fn test_mixed_addition() {
             ]),
             c1: Fp::zero(),
         };
-        let beta = beta.square::<false>();
+        let beta = beta.square();
         let a = G2Projective::generator().double::<false>().double::<false>();
         let b = G2Projective {
             x: a.x * beta,
@@ -2014,7 +2014,7 @@ fn test_psi() {
                 0x1555b67fc7bbe73d,
             ]),
         },
-        z: z.square::<false>() * z,
+        z: z.square() * z,
     };
     assert!(bool::from(point.is_on_curve()));
 
@@ -2091,7 +2091,7 @@ fn test_clear_cofactor() {
                 0x1555b67fc7bbe73d,
             ]),
         },
-        z: z.square::<false>() * z,
+        z: z.square() * z,
     };
 
     assert!(bool::from(point.is_on_curve()));

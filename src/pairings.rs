@@ -48,12 +48,12 @@ impl MillerLoopResult {
     pub fn final_exponentiation<const VARTIME: bool>(&self) -> Gt {
         #[must_use]
         fn fp4_square<const VARTIME: bool>(a: Fp2, b: Fp2) -> (Fp2, Fp2) {
-            let t0 = a.square::<VARTIME>();
-            let t1 = b.square::<VARTIME>();
-            let mut t2 = t1.mul_by_nonresidue::<VARTIME>();
+            let t0 = a.square();
+            let t1 = b.square();
+            let mut t2 = t1.mul_by_nonresidue();
             let c0 = t2 + t0;
             t2 = a + b;
-            t2 = t2.square::<VARTIME>();
+            t2 = t2.square();
             t2 -= t0;
             let c1 = t2 - t1;
 
@@ -91,7 +91,7 @@ impl MillerLoopResult {
             z5 = z5 + z5 + t1;
 
             // For B
-            t0 = t3.mul_by_nonresidue::<VARTIME>();
+            t0 = t3.mul_by_nonresidue();
             z2 = t0 + z2;
             z2 = z2 + z2 + t0;
 
@@ -708,17 +708,17 @@ fn ell<const VARTIME: bool>(f: Fp12, coeffs: &(Fp2, Fp2, Fp2), p: &G1Affine) -> 
 
 fn doubling_step<const VARTIME: bool>(r: &mut G2Projective) -> (Fp2, Fp2, Fp2) {
     // Adaptation of Algorithm 26, https://eprint.iacr.org/2010/354.pdf
-    let tmp0 = r.x.square::<VARTIME>();
-    let tmp1 = r.y.square::<VARTIME>();
-    let tmp2 = tmp1.square::<VARTIME>();
-    let tmp3 = ((&tmp1).add::<VARTIME>(&r.x)).square::<VARTIME>() - tmp0 - tmp2;
+    let tmp0 = r.x.square();
+    let tmp1 = r.y.square();
+    let tmp2 = tmp1.square();
+    let tmp3 = ((&tmp1).add(&r.x)).square() - tmp0 - tmp2;
     let tmp3 = tmp3 + tmp3;
     let tmp4 = tmp0 + tmp0 + tmp0;
     let tmp6 = r.x + tmp4;
-    let tmp5 = tmp4.square::<VARTIME>();
-    let zsquared = r.z.square::<VARTIME>();
+    let tmp5 = tmp4.square();
+    let zsquared = r.z.square();
     r.x = tmp5 - tmp3 - tmp3;
-    r.z = (r.z + r.y).square::<VARTIME>() - tmp1 - zsquared;
+    r.z = (r.z + r.y).square() - tmp1 - zsquared;
     r.y = (tmp3 - r.x) * tmp4;
     let tmp2 = tmp2 + tmp2;
     let tmp2 = tmp2 + tmp2;
@@ -727,7 +727,7 @@ fn doubling_step<const VARTIME: bool>(r: &mut G2Projective) -> (Fp2, Fp2, Fp2) {
     let tmp3 = tmp4 * zsquared;
     let tmp3 = tmp3 + tmp3;
     let tmp3 = -tmp3;
-    let tmp6 = tmp6.square::<VARTIME>() - tmp0 - tmp5;
+    let tmp6 = tmp6.square() - tmp0 - tmp5;
     let tmp1 = tmp1 + tmp1;
     let tmp1 = tmp1 + tmp1;
     let tmp6 = tmp6 - tmp1;
@@ -739,27 +739,27 @@ fn doubling_step<const VARTIME: bool>(r: &mut G2Projective) -> (Fp2, Fp2, Fp2) {
 
 fn addition_step<const VARTIME: bool>(r: &mut G2Projective, q: &G2Affine) -> (Fp2, Fp2, Fp2) {
     // Adaptation of Algorithm 27, https://eprint.iacr.org/2010/354.pdf
-    let zsquared = r.z.square::<VARTIME>();
-    let ysquared = q.y.square::<VARTIME>();
+    let zsquared = r.z.square();
+    let ysquared = q.y.square();
     let t0 = zsquared * q.x;
-    let t1 = ((q.y + r.z).square::<VARTIME>() - ysquared - zsquared) * zsquared;
+    let t1 = ((q.y + r.z).square() - ysquared - zsquared) * zsquared;
     let t2 = t0 - r.x;
-    let t3 = t2.square::<VARTIME>();
+    let t3 = t2.square();
     let t4 = t3 + t3;
     let t4 = t4 + t4;
     let t5 = t4 * t2;
     let t6 = t1 - r.y - r.y;
     let t9 = t6 * q.x;
     let t7 = t4 * r.x;
-    r.x = t6.square::<VARTIME>() - t5 - t7 - t7;
-    r.z = (r.z + t2).square::<VARTIME>() - zsquared - t3;
+    r.x = t6.square() - t5 - t7 - t7;
+    r.z = (r.z + t2).square() - zsquared - t3;
     let t10 = q.y + r.z;
     let t8 = (t7 - r.x) * t6;
     let t0 = r.y * t5;
     let t0 = t0 + t0;
     r.y = t8 - t0;
-    let t10 = t10.square::<VARTIME>() - ysquared;
-    let ztsquared = r.z.square::<VARTIME>();
+    let t10 = t10.square() - ysquared;
+    let ztsquared = r.z.square();
     let t10 = t10 - ztsquared;
     let t9 = t9 + t9 - t10;
     let t10 = r.z + r.z;

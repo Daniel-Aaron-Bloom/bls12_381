@@ -15,7 +15,7 @@ use subtle::{Choice, ConditionallyNegatable, ConditionallySelectable, ConstantTi
 use group::WnafGroup;
 
 use crate::fp::Fp;
-use crate::util::{mac, sbb};
+use crate::util::{mac, sbb, MulOp, Ops, DoubleOp, MontOp, borrowing_sub, SquareOp};
 use crate::Scalar;
 
 /// This is an element of $\mathbb{G}_1$ represented in the affine coordinate space.
@@ -26,9 +26,9 @@ use crate::Scalar;
 /// "unchecked" API was misused.
 #[cfg_attr(docsrs, doc(cfg(feature = "groups")))]
 #[derive(Copy, Clone, Debug)]
-pub struct G1Affine {
-    pub(crate) x: Fp,
-    pub(crate) y: Fp,
+pub struct G1Affine<const VARTIME: bool = false> {
+    pub(crate) x: Fp<0, VARTIME>,
+    pub(crate) y: Fp<0, VARTIME>,
     infinity: Choice,
 }
 
@@ -41,14 +41,14 @@ impl Default for G1Affine {
 #[cfg(feature = "zeroize")]
 impl zeroize::DefaultIsZeroes for G1Affine {}
 
-impl fmt::Display for G1Affine {
+impl<const VARTIME: bool> fmt::Display for G1Affine<VARTIME> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:?}", self)
     }
 }
 
-impl<'a> From<&'a G1Projective> for G1Affine {
-    fn from(p: &'a G1Projective) -> G1Affine {
+impl<'a, const VARTIME: bool> From<&'a G1Projective<VARTIME>> for G1Affine<VARTIME> {
+    fn from(p: &'a G1Projective<VARTIME>) -> G1Affine<VARTIME> {
         let zinv = p.z.invert().unwrap_or(Fp::zero());
         let x = p.x * zinv;
         let y = p.y * zinv;
@@ -63,13 +63,13 @@ impl<'a> From<&'a G1Projective> for G1Affine {
     }
 }
 
-impl From<G1Projective> for G1Affine {
-    fn from(p: G1Projective) -> G1Affine {
+impl<const VARTIME: bool> From<G1Projective<VARTIME>> for G1Affine<VARTIME> {
+    fn from(p: G1Projective<VARTIME>) -> G1Affine<VARTIME> {
         G1Affine::from(&p)
     }
 }
 
-impl ConstantTimeEq for G1Affine {
+impl<const VARTIME: bool> ConstantTimeEq for G1Affine<VARTIME> {
     fn ct_eq(&self, other: &Self) -> Choice {
         // The only cases in which two points are equal are
         // 1. infinity is set on both
@@ -83,7 +83,7 @@ impl ConstantTimeEq for G1Affine {
     }
 }
 
-impl ConditionallySelectable for G1Affine {
+impl<const VARTIME: bool> ConditionallySelectable for G1Affine<VARTIME> {
     fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
         G1Affine {
             x: Fp::conditional_select(&a.x, &b.x, choice),
@@ -93,19 +93,22 @@ impl ConditionallySelectable for G1Affine {
     }
 }
 
-impl Eq for G1Affine {}
-impl PartialEq for G1Affine {
+impl<const VARTIME: bool> Eq for G1Affine<VARTIME> {}
+impl<const VARTIME: bool> PartialEq for G1Affine<VARTIME> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        bool::from(self.ct_eq(other))
+        match VARTIME {
+            true => self.x == other.x && self.y == other.y && self.infinity.unwrap_u8() == other.infinity.unwrap_u8(),
+            false => bool::from(self.ct_eq(other)),
+        }
     }
 }
 
-impl<'a> Neg for &'a G1Affine {
-    type Output = G1Affine;
+impl<'a, const VARTIME: bool> Neg for &'a G1Affine<VARTIME> {
+    type Output = G1Affine<VARTIME>;
 
     #[inline]
-    fn neg(self) -> G1Affine {
+    fn neg(self) -> G1Affine<VARTIME> {
         G1Affine {
             x: self.x,
             y: Fp::conditional_select(&-self.y, &Fp::one(), self.infinity),
@@ -114,54 +117,54 @@ impl<'a> Neg for &'a G1Affine {
     }
 }
 
-impl Neg for G1Affine {
-    type Output = G1Affine;
+impl<const VARTIME: bool> Neg for G1Affine<VARTIME> {
+    type Output = Self;
 
     #[inline]
-    fn neg(self) -> G1Affine {
+    fn neg(self) -> Self {
         -&self
     }
 }
 
-impl<'a, 'b> Add<&'b G1Projective> for &'a G1Affine {
-    type Output = G1Projective;
+impl<'a, 'b, const VARTIME: bool> Add<&'b G1Projective<VARTIME>> for &'a G1Affine<VARTIME> {
+    type Output = G1Projective<VARTIME>;
 
     #[inline]
-    fn add(self, rhs: &'b G1Projective) -> G1Projective {
-        rhs.add_mixed::<false>(self)
+    fn add(self, rhs: &'b G1Projective<VARTIME>) -> G1Projective<VARTIME> {
+        rhs.add_mixed(self)
     }
 }
 
-impl<'a, 'b> Add<&'b G1Affine> for &'a G1Projective {
-    type Output = G1Projective;
+impl<'a, 'b, const VARTIME: bool> Add<&'b G1Affine<VARTIME>> for &'a G1Projective<VARTIME> {
+    type Output = G1Projective<VARTIME>;
 
     #[inline]
-    fn add(self, rhs: &'b G1Affine) -> G1Projective {
-        self.add_mixed::<false>(rhs)
+    fn add(self, rhs: &'b G1Affine<VARTIME>) -> G1Projective<VARTIME> {
+        self.add_mixed(rhs)
     }
 }
 
-impl<'a, 'b> Sub<&'b G1Projective> for &'a G1Affine {
-    type Output = G1Projective;
+impl<'a, 'b, const VARTIME: bool> Sub<&'b G1Projective<VARTIME>> for &'a G1Affine<VARTIME> {
+    type Output = G1Projective<VARTIME>;
 
     #[inline]
-    fn sub(self, rhs: &'b G1Projective) -> G1Projective {
+    fn sub(self, rhs: &'b G1Projective<VARTIME>) -> G1Projective<VARTIME> {
         self + (-rhs)
     }
 }
 
-impl<'a, 'b> Sub<&'b G1Affine> for &'a G1Projective {
-    type Output = G1Projective;
+impl<'a, 'b, const VARTIME: bool> Sub<&'b G1Affine<VARTIME>> for &'a G1Projective<VARTIME> {
+    type Output = G1Projective<VARTIME>;
 
     #[inline]
-    fn sub(self, rhs: &'b G1Affine) -> G1Projective {
+    fn sub(self, rhs: &'b G1Affine<VARTIME>) -> G1Projective<VARTIME> {
         self + (-rhs)
     }
 }
 
-impl<T> Sum<T> for G1Projective
+impl<T, const VARTIME: bool> Sum<T> for G1Projective<VARTIME>
 where
-    T: Borrow<G1Projective>,
+    T: Borrow<G1Projective<VARTIME>>,
 {
     fn sum<I>(iter: I) -> Self
     where
@@ -171,8 +174,17 @@ where
     }
 }
 
-impl_binops_additive!(G1Projective, G1Affine);
-impl_binops_additive_output!(G1Affine, G1Projective);
+impl_binops_additive!{
+    {const VARTIME: bool}
+    {}
+    {G1Projective<VARTIME>} {G1Affine<VARTIME>}
+}
+impl_binops_additive_output!{
+    {const VARTIME: bool}
+    {}
+    {G1Affine<VARTIME>}
+    {G1Projective<VARTIME>}
+}
 
 const B: Fp = Fp::from_raw_unchecked([
     0xaa27_0000_000c_fff3,
@@ -183,9 +195,9 @@ const B: Fp = Fp::from_raw_unchecked([
     0x09d6_4551_3d83_de7e,
 ]);
 
-impl G1Affine {
+impl<const VARTIME: bool> G1Affine<VARTIME> {
     /// Returns the identity of the group: the point at infinity.
-    pub fn identity() -> G1Affine {
+    pub fn identity() -> Self {
         G1Affine {
             x: Fp::zero(),
             y: Fp::one(),
@@ -195,7 +207,7 @@ impl G1Affine {
 
     /// Returns a fixed generator of the group. See [`notes::design`](notes/design/index.html#fixed-generators)
     /// for how this generator is chosen.
-    pub fn generator() -> G1Affine {
+    pub fn generator() -> Self {
         G1Affine {
             x: Fp::from_raw_unchecked([
                 0x5cb3_8790_fd53_0c16,
@@ -217,10 +229,26 @@ impl G1Affine {
         }
     }
 
-    /// Multiplies this point by a scalar.
+    /// Adjusts the `VARTIME` setting
     #[inline]
-    pub fn mul<const VARTIME: bool>(self, other: &Scalar) -> G1Projective {
-        G1Projective::from(self).mul::<VARTIME>(other)
+    pub const fn vartime<const VARTIME2: bool>(self) -> G1Affine<VARTIME2> {
+        G1Affine{
+            x: self.x.vartime(),
+            y: self.y.vartime(),
+            infinity: self.infinity,
+        }
+    }
+
+    /// Returns true if this element is the identity (the point at infinity).
+    #[inline]
+    pub fn is_identity(&self) -> Choice {
+        self.infinity
+    }
+
+    /// Returns true if this element is the identity (the point at infinity).
+    #[inline]
+    pub fn is_identity_vartime(&self) -> bool {
+        self.infinity.into()
     }
 
     /// Serializes this element into compressed form. See [`notes::serialization`](crate::notes::serialization)
@@ -247,6 +275,38 @@ impl G1Affine {
 
         res
     }
+
+    /// Multiplies this point by a scalar.
+    #[inline]
+    pub fn mul(self, other: &Scalar<0, VARTIME>) -> G1Projective<VARTIME> {
+        G1Projective::from(self).mul(other)
+    }
+
+    /// Returns true if this point is free of an $h$-torsion component, and so it
+    /// exists within the $q$-order subgroup $\mathbb{G}_1$. This should always return true
+    /// unless an "unchecked" API was used.
+    pub fn is_torsion_free(&self) -> Choice {
+        // Algorithm from Section 6 of https://eprint.iacr.org/2021/1130
+        // Updated proof of correctness in https://eprint.iacr.org/2022/352
+        //
+        // Check that endomorphism_p(P) == -[x^2] P
+
+        let minus_x_squared_times_p = G1Projective::from(self).mul_by_x().mul_by_x().neg();
+        let endomorphism_p = endomorphism(self);
+        minus_x_squared_times_p.ct_eq(&G1Projective::from(endomorphism_p))
+    }
+
+    /// Returns true if this point is on the curve. This should always return
+    /// true unless an "unchecked" API was used.
+    pub fn is_on_curve(&self) -> Choice {
+        // y^2 - x^3 ?= 4
+        let y_2 = SquareOp::square(&self.y);
+        let x_3 = MulOp::mul(&MontOp::montgomery_reduce(&SquareOp::square(&self.x)), &self.x);
+        Ops::sub(&y_2, &x_3).montgomery_reduce_full().ct_eq(&B.vartime::<VARTIME>()) | self.infinity
+    }
+}
+
+impl G1Affine {
 
     /// Serializes this element into uncompressed form. See [`notes::serialization`](crate::notes::serialization)
     /// for details about how group elements are serialized.
@@ -374,7 +434,7 @@ impl G1Affine {
             )
             .or_else(|| {
                 // Recover a y-coordinate given x by y = sqrt(x^3 + 4)
-                ((x.square::<false>() * x) + B).sqrt().and_then(|y| {
+                ((x.square() * x) + B).sqrt().and_then(|y| {
                     // Switch to the correct y-coordinate if necessary.
                     let y = Fp::conditional_select(
                         &y,
@@ -394,33 +454,6 @@ impl G1Affine {
                 })
             })
         })
-    }
-
-    /// Returns true if this element is the identity (the point at infinity).
-    #[inline]
-    pub fn is_identity(&self) -> Choice {
-        self.infinity
-    }
-
-    /// Returns true if this point is free of an $h$-torsion component, and so it
-    /// exists within the $q$-order subgroup $\mathbb{G}_1$. This should always return true
-    /// unless an "unchecked" API was used.
-    pub fn is_torsion_free(&self) -> Choice {
-        // Algorithm from Section 6 of https://eprint.iacr.org/2021/1130
-        // Updated proof of correctness in https://eprint.iacr.org/2022/352
-        //
-        // Check that endomorphism_p(P) == -[x^2] P
-
-        let minus_x_squared_times_p = G1Projective::from(self).mul_by_x::<false>().mul_by_x::<false>().neg();
-        let endomorphism_p = endomorphism(self);
-        minus_x_squared_times_p.ct_eq(&G1Projective::from(endomorphism_p))
-    }
-
-    /// Returns true if this point is on the curve. This should always return
-    /// true unless an "unchecked" API was used.
-    pub fn is_on_curve(&self) -> Choice {
-        // y^2 - x^3 ?= 4
-        (self.y.square::<false>() - (self.x.square::<false>() * self.x)).ct_eq(&B) | self.infinity
     }
 }
 
@@ -448,12 +481,12 @@ const BETA_2: Fp = Fp::from_raw_unchecked([
 const G1_WIDTH: i32 = 5;
 
 #[inline]
-const fn sub_short(a: &[u64; 4], b: &[u64; 4]) -> ([u64; 4], i8) {
-    let (d0, borrow) = sbb(a[0], b[0], 0);
-    let (d1, borrow) = sbb(a[1], b[1], borrow);
-    let (d2, borrow) = sbb(a[2], b[2], borrow);
-    let (d3, borrow) = sbb(a[3], b[3], borrow);
-    ([d0, d1, d2, d3], borrow as i8)
+const fn sub_short(a: &[u64; 4], b: &[u64; 4]) -> ([u64; 4], bool) {
+    let (d0, borrow) = borrowing_sub(a[0], b[0], false);
+    let (d1, borrow) = borrowing_sub(a[1], b[1], borrow);
+    let (d2, borrow) = borrowing_sub(a[2], b[2], borrow);
+    let (d3, borrow) = borrowing_sub(a[3], b[3], borrow);
+    ([d0, d1, d2, d3], borrow)
 }
 
 #[inline]
@@ -482,7 +515,7 @@ const fn mul_short(a: &[u64; 4], b: &[u64; 4]) -> [u64; 8] {
     [r0, r1, r2, r3, r4, r5, r6, 0]
 }
 
-fn glv_recoding(k: &[u8; 32]) -> (i8, [u8; 32], i8, [u8; 32]) {
+fn glv_recoding<const VARTIME: bool>(k: &[u8; 32]) -> (i8, [u8; 32], i8, [u8; 32]) {
     const V: [[u64; 4]; 2] = [
         [0x63f6_e522_f6cf_ee2f, 0x7c6b_ecf1_e01f_aadd, 1, 0],
         [0x0000_0000_ffff_ffff, 0xac45_a401_0001_a402, 0, 0],
@@ -502,14 +535,18 @@ fn glv_recoding(k: &[u8; 32]) -> (i8, [u8; 32], i8, [u8; 32]) {
     let b1 = mul_short(&b2h, &V[1]);
     let b1l = [b1[0], b1[1], b1[2], b1[3]];
     let (b1l, s1) = sub_short(&t, &b1l);
-    let minus_k1 = Scalar::from_raw([!b1l[0], !b1l[1], !b1l[2], !b1l[3]]) + Scalar::one();
+    let minus_k1: Scalar = Scalar::from_raw([!b1l[0], !b1l[1], !b1l[2], !b1l[3]]) + Scalar::one();
 
     let k1 = Scalar::from_raw(b1l);
-    let k1 = Scalar::conditional_select(&k1, &minus_k1, Choice::from(-s1 as u8));
-    let k2 = Scalar::from_raw(b2h);
+    let k1 = match VARTIME {
+        true if s1 => minus_k1,
+        true => k1,
+        false => Scalar::conditional_select(&k1, &minus_k1, Choice::from(s1 as u8)),
+    };
+    let k2: Scalar = Scalar::from_raw(b2h);
 
     // k2 is always positive for this curve.
-    (s1, k1.to_bytes(), 0, k2.to_bytes())
+    (-(s1 as i8), k1.to_bytes(), 0, k2.to_bytes())
 }
 
 fn regular_recoding(naf: &mut [i8; 128], sc: &mut [u8; 32]) {
@@ -530,41 +567,41 @@ fn regular_recoding(naf: &mut [i8; 128], sc: &mut [u8; 32]) {
     naf[len - 1] = sc[0] as i8;
 }
 
-fn endomorphism(p: &G1Affine) -> G1Affine {
+fn endomorphism<const VARTIME: bool>(p: &G1Affine<VARTIME>) -> G1Affine<VARTIME> {
     // Endomorphism of the points on the curve.
     // endomorphism_p(x,y) = (BETA * x, y)
     // where BETA is a non-trivial cubic root of unity in Fq.
     let mut res = *p;
-    res.x *= BETA;
+    res.x *= BETA.vartime::<VARTIME>();
     res
 }
 
 /// This is an element of $\mathbb{G}_1$ represented in the projective coordinate space.
 #[cfg_attr(docsrs, doc(cfg(feature = "groups")))]
 #[derive(Copy, Clone, Debug)]
-pub struct G1Projective {
-    pub(crate) x: Fp,
-    pub(crate) y: Fp,
-    pub(crate) z: Fp,
+pub struct G1Projective<const VARTIME: bool = false> {
+    pub(crate) x: Fp<0, VARTIME>,
+    pub(crate) y: Fp<0, VARTIME>,
+    pub(crate) z: Fp<0, VARTIME>,
 }
 
-impl Default for G1Projective {
-    fn default() -> G1Projective {
+impl<const VARTIME: bool> Default for G1Projective<VARTIME> {
+    fn default() -> Self {
         G1Projective::identity()
     }
 }
 
 #[cfg(feature = "zeroize")]
-impl zeroize::DefaultIsZeroes for G1Projective {}
+impl<const VARTIME: bool> zeroize::DefaultIsZeroes for G1Projective<VARTIME> {}
 
-impl fmt::Display for G1Projective {
+impl<const VARTIME: bool> fmt::Display for G1Projective<VARTIME> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:?}", self)
     }
 }
 
-impl<'a> From<&'a G1Affine> for G1Projective {
-    fn from(p: &'a G1Affine) -> G1Projective {
+impl<'a, const VARTIME: bool> From<&'a G1Affine<VARTIME>> for G1Projective<VARTIME> {
+    fn from(p: &'a G1Affine<VARTIME>) -> Self {
         G1Projective {
             x: p.x,
             y: p.y,
@@ -573,13 +610,13 @@ impl<'a> From<&'a G1Affine> for G1Projective {
     }
 }
 
-impl From<G1Affine> for G1Projective {
-    fn from(p: G1Affine) -> G1Projective {
+impl<const VARTIME: bool> From<G1Affine<VARTIME>> for G1Projective<VARTIME> {
+    fn from(p: G1Affine<VARTIME>) -> Self {
         G1Projective::from(&p)
     }
 }
 
-impl ConstantTimeEq for G1Projective {
+impl<const VARTIME: bool> ConstantTimeEq for G1Projective<VARTIME> {
     fn ct_eq(&self, other: &Self) -> Choice {
         // Is (xz, yz, z) equal to (x'z', y'z', z') when converted to affine?
 
@@ -598,7 +635,7 @@ impl ConstantTimeEq for G1Projective {
     }
 }
 
-impl ConditionallySelectable for G1Projective {
+impl<const VARTIME: bool> ConditionallySelectable for G1Projective<VARTIME> {
     fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
         G1Projective {
             x: Fp::conditional_select(&a.x, &b.x, choice),
@@ -608,19 +645,22 @@ impl ConditionallySelectable for G1Projective {
     }
 }
 
-impl Eq for G1Projective {}
-impl PartialEq for G1Projective {
+impl<const VARTIME: bool> Eq for G1Projective<VARTIME> {}
+impl<const VARTIME: bool> PartialEq for G1Projective<VARTIME> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        bool::from(self.ct_eq(other))
+        match VARTIME {
+            true => self.x == other.x && self.y == other.y && self.z == other.z,
+            false => bool::from(self.ct_eq(other)),
+        }
     }
 }
 
-impl<'a> Neg for &'a G1Projective {
-    type Output = G1Projective;
+impl<'a, const VARTIME: bool> Neg for &'a G1Projective<VARTIME> {
+    type Output = G1Projective<VARTIME>;
 
     #[inline]
-    fn neg(self) -> G1Projective {
+    fn neg(self) -> G1Projective<VARTIME> {
         G1Projective {
             x: self.x,
             y: -self.y,
@@ -629,83 +669,112 @@ impl<'a> Neg for &'a G1Projective {
     }
 }
 
-impl Neg for G1Projective {
-    type Output = G1Projective;
+impl<const VARTIME: bool> Neg for G1Projective<VARTIME> {
+    type Output = Self;
 
     #[inline]
-    fn neg(self) -> G1Projective {
+    fn neg(self) -> Self {
         -&self
     }
 }
 
-impl<'a, 'b> Add<&'b G1Projective> for &'a G1Projective {
-    type Output = G1Projective;
+impl<'a, 'b, const VARTIME: bool> Add<&'b G1Projective<VARTIME>> for &'a G1Projective<VARTIME> {
+    type Output = G1Projective<VARTIME>;
 
     #[inline]
-    fn add(self, rhs: &'b G1Projective) -> G1Projective {
-        self.add::<false>(rhs)
+    fn add(self, rhs: &'b G1Projective<VARTIME>) -> Self::Output {
+        self.add(rhs)
     }
 }
 
-impl<'a, 'b> Sub<&'b G1Projective> for &'a G1Projective {
-    type Output = G1Projective;
+impl<'a, 'b, const VARTIME: bool> Sub<&'b G1Projective<VARTIME>> for &'a G1Projective<VARTIME> {
+    type Output = G1Projective<VARTIME>;
 
     #[inline]
-    fn sub(self, rhs: &'b G1Projective) -> G1Projective {
+    fn sub(self, rhs: &'b G1Projective<VARTIME>) -> Self::Output {
         self + (-rhs)
     }
 }
 
-impl<'a, 'b> Mul<&'b Scalar> for &'a G1Projective {
-    type Output = G1Projective;
+impl<'a, 'b, const VARTIME: bool> Mul<&'b Scalar<0, VARTIME>> for &'a G1Projective<VARTIME> {
+    type Output = G1Projective<VARTIME>;
 
-    fn mul(self, other: &'b Scalar) -> Self::Output {
-        self.multiply::<false>(&other.to_bytes())
+    fn mul(self, other: &'b Scalar<0, VARTIME>) -> Self::Output {
+        self.multiply(&other.to_bytes())
     }
 }
 
-impl<'a, 'b> Mul<&'b G1Projective> for &'a Scalar {
-    type Output = G1Projective;
+impl<'a, 'b, const VARTIME: bool> Mul<&'b G1Projective<VARTIME>> for &'a Scalar<0, VARTIME> {
+    type Output = G1Projective<VARTIME>;
 
     #[inline]
-    fn mul(self, rhs: &'b G1Projective) -> Self::Output {
+    fn mul(self, rhs: &'b G1Projective<VARTIME>) -> Self::Output {
         rhs * self
     }
 }
 
-impl<'a, 'b> Mul<&'b Scalar> for &'a G1Affine {
-    type Output = G1Projective;
+impl<'a, 'b, const VARTIME: bool> Mul<&'b Scalar<0, VARTIME>> for &'a G1Affine<VARTIME> {
+    type Output = G1Projective<VARTIME>;
 
-    fn mul(self, other: &'b Scalar) -> Self::Output {
-        G1Projective::from(self).multiply::<false>(&other.to_bytes())
+    fn mul(self, other: &'b Scalar<0, VARTIME>) -> Self::Output {
+        G1Projective::from(self).multiply(&other.to_bytes())
     }
 }
 
-impl<'a, 'b> Mul<&'b G1Affine> for &'a Scalar {
-    type Output = G1Projective;
+impl<'a, 'b, const VARTIME: bool> Mul<&'b G1Affine<VARTIME>> for &'a Scalar<0, VARTIME> {
+    type Output = G1Projective<VARTIME>;
 
     #[inline]
-    fn mul(self, rhs: &'b G1Affine) -> Self::Output {
+    fn mul(self, rhs: &'b G1Affine<VARTIME>) -> Self::Output {
         rhs * self
     }
 }
 
-impl_binops_additive!(G1Projective, G1Projective);
-impl_binops_multiplicative!(G1Projective, Scalar);
-impl_binops_multiplicative_mixed!(G1Affine, Scalar, G1Projective);
-impl_binops_multiplicative_mixed!(Scalar, G1Affine, G1Projective);
-impl_binops_multiplicative_mixed!(Scalar, G1Projective, G1Projective);
+impl_binops_additive!{
+    {const VARTIME: bool}
+    {}
+    {G1Projective<VARTIME>}
+    {G1Projective<VARTIME>}
+}
+impl_binops_multiplicative!{
+    {const VARTIME: bool}
+    {}
+    {G1Projective<VARTIME>}
+    {Scalar<0, VARTIME>}
+}
+impl_binops_multiplicative_mixed!{
+    {const VARTIME: bool}
+    {}
+    {G1Affine<VARTIME>} {Scalar<0, VARTIME>} {G1Projective<VARTIME>}
+}
+impl_binops_multiplicative_mixed!{
+    {const VARTIME: bool}
+    {}
+    {Scalar<0, VARTIME>} {G1Affine<VARTIME>} {G1Projective<VARTIME>}
+}
+impl_binops_multiplicative_mixed!{
+    {const VARTIME: bool}
+    {}
+    {Scalar<0, VARTIME>} {G1Projective<VARTIME>} {G1Projective<VARTIME>}
+}
 
 #[inline(always)]
-fn mul_by_3b<const VARTIME: bool>(a: Fp) -> Fp {
-    let a = a.double::<VARTIME>(); // 2
-    let a = a.double::<VARTIME>(); // 4
-    a.double::<VARTIME>() + a // 12
+fn mul_by_3b<const VARTIME: bool>(a: Fp<0, VARTIME>) -> Fp<0, VARTIME> {
+    let a = a.double(); // 2
+    let a = a.double(); // 4
+    a.double() + a // 12
 }
 
-impl G1Projective {
+macro_rules! mul_by_3b {
+    ($a:expr) => {{
+        let a = DoubleOp::<1>::double(&$a); // 4
+        Ops::add(&DoubleOp::<0>::double(&a), &a) // 12
+    }};
+}
+
+impl<const VARTIME: bool> G1Projective<VARTIME> {
     /// Returns the identity of the group: the point at infinity.
-    pub fn identity() -> G1Projective {
+    pub fn identity() -> Self {
         G1Projective {
             x: Fp::zero(),
             y: Fp::one(),
@@ -715,7 +784,7 @@ impl G1Projective {
 
     /// Returns a fixed generator of the group. See [`notes::design`](notes/design/index.html#fixed-generators)
     /// for how this generator is chosen.
-    pub fn generator() -> G1Projective {
+    pub fn generator() -> Self {
         G1Projective {
             x: Fp::from_raw_unchecked([
                 0x5cb3_8790_fd53_0c16,
@@ -737,202 +806,189 @@ impl G1Projective {
         }
     }
 
-    /// Computes the doubling of this point.
-    pub fn double<const VARTIME: bool>(&self) -> G1Projective {
+    /// Adjusts the `VARTIME` setting
+    #[inline]
+    pub const fn vartime<const VARTIME2: bool>(self) -> G1Projective<VARTIME2> {
+        G1Projective{
+            x: self.x.vartime(),
+            y: self.y.vartime(),
+            z: self.z.vartime(),
+        }
+    }
+
+
+    /// Returns true if this element is the identity (the point at infinity).
+    #[inline]
+    pub fn is_identity(&self) -> Choice {
+        self.z.is_zero()
+    }
+
+    /// Returns true if this element is the identity (the point at infinity).
+    #[inline]
+    pub const fn is_identity_vartime(&self) -> bool {
+        self.z.is_zero_vartime()
+    }
+
+    fn double_helper(&self) -> Self {
         // Algorithm 9, https://eprint.iacr.org/2015/1060.pdf
+        let t0 = MontOp::montgomery_reduce(&SquareOp::square(&self.y)).reduce_full();
+        let z3 = DoubleOp::<2>::double(&t0);
+        let t1 = MontOp::montgomery_reduce(&MulOp::mul(&self.y, &self.z));
+        let t2 = SquareOp::square(&self.z);
+        let t2 = MontOp::montgomery_reduce(&mul_by_3b!(t2)).reduce_full();
+        let x3 = MontOp::montgomery_reduce(&MulOp::mul(&t2, &z3)); // t2 * z3
+        let y3 = Ops::add(&t0, &t2);
+        let z3 = MulOp::mul(&t1, &z3);
+        let t1 = DoubleOp::<0>::double(&t2);
+        let t2 = Ops::add(&t1, &t2);
+        let t0 = Ops::sub(&t0, &t2);
+        let y3 = MontOp::montgomery_reduce(&MulOp::mul(&t0, &y3)); // t0 * y3
+        let y3 = Ops::add(&x3, &y3);
+        let t1 = MontOp::montgomery_reduce(&MulOp::mul(&self.x, &self.y));
+        let x3 = MulOp::mul(&t0, &t1);
+        let x3 = DoubleOp::<0>::double(&x3);
 
-        let t0 = self.y.square::<VARTIME>();
-        let z3 = t0.double::<VARTIME>();
-        let z3 = z3.double::<VARTIME>();
-        let z3 = z3.double::<VARTIME>();
-        let t1 = self.y * self.z;
-        let t2 = self.z.square::<VARTIME>();
-        let t2 = mul_by_3b::<VARTIME>(t2);
-        let x3 = t2.mul_unreduced(&z3); // t2 * z3
-        let y3 = t0 + t2;
-        let z3 = t1 * z3;
-        let t1 = t2.double::<VARTIME>();
-        let t2 = t1 + t2;
-        let t0 = t0 - t2;
-        let y3 = t0.mul_unreduced(&y3); // t0 * y3
-        let y3 = x3 + y3;
-        let t1 = self.x * self.y;
-        let x3 = t0 * t1;
-        let x3 = x3.double::<VARTIME>();
+        G1Projective {
+            x: x3.montgomery_reduce_full(),
+            y: y3.reduce_full(),
+            z: z3.montgomery_reduce_full(),
+        }
+    }
 
-        let tmp = G1Projective {
-            x: x3,
-            y: y3.montgomery_reduce::<VARTIME>(),
-            z: z3,
-        };
-
-        if VARTIME {
-            if self.is_identity_vartime() {
-                G1Projective::identity()
-            } else {
-                tmp
+    /// Computes the doubling of this point.
+    pub fn double(&self) -> Self {
+        match VARTIME {
+            true if self.is_identity_vartime() => G1Projective::identity(),
+            true => self.double_helper(),
+            false => {
+                G1Projective::conditional_select(&self.double_helper(), self, self.is_identity())
             }
-        } else {
-            G1Projective::conditional_select(&tmp, self, self.is_identity())
         }
     }
 
     /// Adds this point to another point.
-    pub fn add<const VARTIME: bool>(&self, rhs: &G1Projective) -> G1Projective {
+    pub fn add(&self, rhs: &Self) -> Self {
         // Algorithm 7, https://eprint.iacr.org/2015/1060.pdf
 
-        let t0 = self.x * rhs.x;
-        let t1 = self.y * rhs.y;
-        let t2 = self.z * rhs.z;
-        let t3 = self.x + self.y;
-        let t4 = rhs.x + rhs.y;
-        let t3 = t3 * t4;
-        let t4 = t0 + t1;
-        let t3 = t3 - t4;
-        let t4 = self.y + self.z;
-        let x3 = rhs.y + rhs.z;
-        let t4 = t4 * x3;
-        let x3 = t1 + t2;
-        let t4 = t4 - x3;
-        let x3 = self.x + self.z;
-        let y3 = rhs.x + rhs.z;
-        let x3 = x3 * y3;
-        let y3 = t0 + t2;
-        let y3 = x3 - y3;
-        let x3 = t0.double::<VARTIME>();
-        let t0 = x3 + t0;
-        let t2 = mul_by_3b::<VARTIME>(t2);
-        let z3 = t1 + t2;
-        let t1 = t1 - t2;
-        let y3 = mul_by_3b::<VARTIME>(y3);
-        let x3 = t4.mul_unreduced(&y3); // t4 * y3
-        let t2 = t3.mul_unreduced(&t1); // t3 * t1
-        let x3 = t2 - x3;
-        let y3 = y3.mul_unreduced(&t0); // y3 * t0
-        let t1 = t1.mul_unreduced(&z3); // t1 * z3
-        let y3 = t1 + y3;
-        let t0 = t0.mul_unreduced(&t3); // t0 * t3
-        let z3 = z3.mul_unreduced(&t4); // z3 * t4
-        let z3 = z3 + t0;
+        let t0 = MontOp::montgomery_reduce(&MulOp::mul(&self.x, &rhs.x));
+        let t1 = MontOp::montgomery_reduce(&MulOp::mul(&self.y, &rhs.y));
+        let t2 = MontOp::montgomery_reduce(&MulOp::mul(&self.z, &rhs.z));
+        let t3 = Ops::add(&self.x, &self.y);
+        let t4 = Ops::add(&rhs.x, &rhs.y);
+        let t3 = MontOp::montgomery_reduce(&MulOp::mul(&t3, &t4));
+        let t4 = Ops::add(&t0, &t1);
+        let t3 = Ops::sub(&t3, &t4);
+        let t4 = Ops::add(&self.y, &self.z);
+        let x3 = Ops::add(&rhs.y, &rhs.z);
+        let t4 = MontOp::montgomery_reduce(&MulOp::mul(&t4, &x3));
+        let x3 = Ops::add(&t1, &t2);
+        let t4 = Ops::sub(&t4, &x3);
+        let x3 = Ops::add(&self.x, &self.z);
+        let y3 = Ops::add(&rhs.x, &rhs.z);
+        let x3 = MontOp::montgomery_reduce(&MulOp::mul(&x3, &y3));
+        let y3 = Ops::add(&t0, &t2);
+        let y3 = Ops::sub(&x3, &y3);
+        let x3 = DoubleOp::<0>::double(&t0);
+        let t0 = Ops::add(&x3, &t0);
+        let t2 = mul_by_3b(t2.reduce_full());
+        let z3 = Ops::add(&t1, &t2);
+        let t1 = Ops::sub(&t1, &t2);
+        let y3 = mul_by_3b(y3.reduce_full());
+        let x3 = MulOp::mul(&t4, &y3); // t4 * y3
+        let t2 = MulOp::mul(&t3, &t1); // t3 * t1
+        let x3 = Ops::sub(&t2, &x3);
+        let y3 = MulOp::mul(&y3, &t0); // y3 * t0
+        let t1 = MulOp::mul(&t1, &z3); // t1 * z3
+        let y3 = Ops::add(&t1, &y3);
+        let t0 = MulOp::mul(&t0, &t3); // t0 * t3
+        let z3 = MulOp::mul(&z3, &t4); // z3 * t4
+        let z3 = Ops::add(&z3, &t0);
 
         G1Projective {
-            x: x3.montgomery_reduce::<VARTIME>(),
-            y: y3.montgomery_reduce::<VARTIME>(),
-            z: z3.montgomery_reduce::<VARTIME>(),
+            x: x3.montgomery_reduce_full(),
+            y: y3.montgomery_reduce_full(),
+            z: z3.montgomery_reduce_full(),
+        }
+    }
+    
+    /// Adds this point to another point in the affine model.
+    fn add_mixed_helper(&self, rhs: &G1Affine<VARTIME>) -> Self {
+        // Algorithm 8, https://eprint.iacr.org/2015/1060.pdf
+
+        let t0 = MontOp::montgomery_reduce(&MulOp::mul(&self.x, &rhs.x));
+        let t1 = MontOp::montgomery_reduce(&MulOp::mul(&self.y, &rhs.y));
+        let t3 = Ops::add(&rhs.x, &rhs.y);
+        let t4 = Ops::add(&self.x, &self.y);
+        let t3 = MontOp::montgomery_reduce(&MulOp::mul(&t3, &t4));
+        let t4 = Ops::add(&t0, &t1);
+        let t3 = Ops::sub(&t3, &t4);
+        let t4 = MontOp::montgomery_reduce(&MulOp::mul(&rhs.y, &self.z));
+        let t4 = Ops::add(&t4, &self.y);
+        let y3 = MontOp::montgomery_reduce(&MulOp::mul(&rhs.x, &self.z));
+        let y3 = Ops::add(&y3, &self.x);
+        let x3 = DoubleOp::<0>::double(&t0);
+        let t0 = Ops::add(&x3, &t0);
+        let t2 = mul_by_3b::<VARTIME>(self.z);
+        let z3 = Ops::add(&t1, &t2);
+        let t1 = Ops::sub(&t1, &t2);
+        let y3 = mul_by_3b::<VARTIME>(y3.reduce_full());
+        let x3 = MulOp::mul(&t4, &y3); // t4 * y3
+        let t2 = MulOp::mul(&t3, &t1); // t3 * t1
+        let x3 = Ops::sub(&t2, &x3);
+        let y3 = MulOp::mul(&y3, &t0); // y3 * t0
+        let t1 = MulOp::mul(&t1, &z3); // t1 * z3
+        let y3 = Ops::add(&t1, &y3);
+        let t0 = MulOp::mul(&t0, &t3); // t0 * t3
+        let z3 = MulOp::mul(&z3, &t4); // z3 * t4
+        let z3 = Ops::add(&z3, &t0);
+
+        G1Projective {
+            x: x3.montgomery_reduce_full(),
+            y: y3.montgomery_reduce_full(),
+            z: z3.montgomery_reduce_full(),
         }
     }
 
     /// Adds this point to another point in the affine model.
-    pub fn add_mixed<const VARTIME: bool>(&self, rhs: &G1Affine) -> G1Projective {
-        // Algorithm 8, https://eprint.iacr.org/2015/1060.pdf
-
-        let t0 = self.x * rhs.x;
-        let t1 = self.y * rhs.y;
-        let t3 = rhs.x + rhs.y;
-        let t4 = self.x + self.y;
-        let t3 = t3 * t4;
-        let t4 = t0 + t1;
-        let t3 = t3 - t4;
-        let t4 = rhs.y * self.z;
-        let t4 = t4 + self.y;
-        let y3 = rhs.x * self.z;
-        let y3 = y3 + self.x;
-        let x3 = t0.double::<VARTIME>();
-        let t0 = x3 + t0;
-        let t2 = mul_by_3b::<VARTIME>(self.z);
-        let z3 = t1 + t2;
-        let t1 = t1 - t2;
-        let y3 = mul_by_3b::<VARTIME>(y3);
-        let x3 = t4.mul_unreduced(&y3); // t4 * y3
-        let t2 = t3.mul_unreduced(&t1); // t3 * t1
-        let x3 = t2 - x3;
-        let y3 = y3.mul_unreduced(&t0); // y3 * t0
-        let t1 = t1.mul_unreduced(&z3); // t1 * z3
-        let y3 = t1 + y3;
-        let t0 = t0.mul_unreduced(&t3); // t0 * t3
-        let z3 = z3.mul_unreduced(&t4); // z3 * t4
-        let z3 = z3 + t0;
-
-        let tmp = G1Projective {
-            x: x3.montgomery_reduce::<VARTIME>(),
-            y: y3.montgomery_reduce::<VARTIME>(),
-            z: z3.montgomery_reduce::<VARTIME>(),
-        };
-
-        if VARTIME {
-            if self.is_identity_vartime() {
-                G1Projective::identity()
-            } else {
-                tmp
-            }
-        } else {
-            G1Projective::conditional_select(&tmp, self, rhs.is_identity())
+    pub fn add_mixed(&self, rhs: &G1Affine<VARTIME>) -> Self {
+        match VARTIME {
+            true if rhs.is_identity_vartime() => *self,
+            true => self.add_mixed_helper(rhs),
+            false => G1Projective::conditional_select(&self.add_mixed_helper(rhs), self, rhs.is_identity())
         }
     }
 
     /// Multiplies this point by a scalar.
     #[inline]
-    pub fn mul<const VARTIME: bool>(self, other: &Scalar) -> G1Projective {
-        self.multiply::<VARTIME>(&other.to_bytes())
+    pub fn mul(self, other: &Scalar<0, VARTIME>) -> Self {
+        self.multiply(&other.to_bytes())
     }
 
-    //fn precompute(&self) -> [G1Affine; 1 << (G1_WIDTH - 2)] {
-    fn precompute<const VARTIME: bool>(&self) -> [G1Projective; 1 << (G1_WIDTH - 2)] {
+    fn precompute(&self) -> [Self; 1 << (G1_WIDTH - 2)] {
         // Size of precomputation table is 2^(w-2).
-        //let mut table = [G1Affine::from(self); 1 << (G1_WIDTH - 2)];
         let mut proj_table = [*self; 1 << (G1_WIDTH - 2)];
         if G1_WIDTH > 2 {
-            let double_point = self.double::<VARTIME>();
+            let double_point = self.double();
             let mut prev = *self;
             for i in proj_table.iter_mut().skip(1) {
                 prev += double_point;
                 *i = prev;
             }
-            //G1Projective::batch_normalize(&proj_table[1..], &mut table[1..]);
         }
         proj_table
-        //table
     }
 
-    fn linear_pass<T: Default + ConditionallySelectable, const VARTIME: bool>(index: u8, table: &[T]) -> T {
+    fn linear_pass<T: Default + ConditionallySelectable>(index: u8, table: &[T]) -> T {
         // Scan table of points to read table[index]
         let mut tmp = table[0];
         for (j, jv) in table.iter().enumerate().skip(1) {
-            if VARTIME {
-                if j as u8 == index {
-                    tmp = *jv;
-                }
-            } else {
-                tmp.conditional_assign(jv, (j as u8).ct_eq(&index));
-            }
+            tmp.conditional_assign(jv, (j as u8).ct_eq(&index));
         }
         tmp
     }
 
-    fn multiply<const VARTIME: bool>(&self, by: &[u8; 32]) -> G1Projective {
+    fn multiply(&self, by: &[u8; 32]) -> Self {
         let mut acc = G1Projective::identity();
-
-        if VARTIME {
-            // This is a simple double-and-add implementation of point
-            // multiplication, moving from most significant to least
-            // significant bit of the scalar.
-            //
-            // We skip the leading bit because it's always unset for Fq
-            // elements.
-            for bit in by
-                .iter()
-                .rev()
-                .flat_map(|byte| (0..8).rev().map(move |i| (byte >> i) & 1u8))
-                .skip(1)
-            {   
-                acc = acc.double::<VARTIME>();
-                if bit == 1 {
-                    acc += self;
-                }
-            }
-    
-            return acc
-        }
 
         // Length of recoding is ceil(scalar bitlength, w - 1).
         let len = 2 + (128 - 1) / (G1_WIDTH - 1) as usize;
@@ -940,8 +996,8 @@ impl G1Projective {
         // Allocate longest possible vector, recode scalar and precompute table.
         let mut naf1 = [0 as i8; 128];
         let mut naf2 = [0 as i8; 128];
-        let (s1, mut k1, s2, mut k2) = glv_recoding(&by);
-        let mut table = self.precompute::<VARTIME>();
+        let (s1, mut k1, s2, mut k2) = glv_recoding::<VARTIME>(&by);
+        let mut table = self.precompute();
 
         let bit1 = k1[0] & 1u8;
         k1[0] |= 1;
@@ -953,7 +1009,7 @@ impl G1Projective {
 
         for i in (0..len).rev() {
             for _ in 1..G1_WIDTH {
-                acc = acc.double::<VARTIME>();
+                acc = acc.double();
             }
             let sign = naf1[i] >> 7;
             let index = ((naf1[i] ^ sign) - sign) >> 1;
@@ -962,7 +1018,7 @@ impl G1Projective {
                 true if sign != s1 => -table[index as usize],
                 true => table[index as usize],
                 false => {
-                    let mut t = Self::linear_pass::<_, VARTIME>(index as u8, &table);
+                    let mut t = Self::linear_pass(index as u8, &table);
                     // Negate point if either k1 or naf1[i] is negative.
                     t.conditional_negate(Choice::from(-(sign ^ s1) as u8));
                     t
@@ -972,36 +1028,59 @@ impl G1Projective {
 
             let sign = naf2[i] >> 7;
             let index = ((naf2[i] ^ sign) - sign) >> 1;
-            let mut t = Self::linear_pass::<_, VARTIME>(index as u8, &table);
-            // Negate point if either k2 or naf2[i] is negative.
-            t.conditional_negate(Choice::from(-(sign ^ s2) as u8));
-            t.x *= BETA_2;
+            let mut t = match VARTIME {
+                // Negate point if either k2 or naf2[i] is negative.
+                true if sign != s2 => -table[index as usize],
+                true => table[index as usize],
+                false => {
+                    let mut t = Self::linear_pass(index as u8, &table);
+                    t.conditional_negate(Choice::from(-(sign ^ s2) as u8));
+                    t
+                }
+            };
+            t.x *= BETA_2.vartime::<VARTIME>();
             acc += t;
         }
         // If the subscalars were even, fix result here.
-        let t = ConditionallySelectable::conditional_select(
-            &table[0],
-            &-table[0],
-            Choice::from(-s1 as u8),
-        );
-        acc = G1Projective::conditional_select(&(acc - t), &acc, Choice::from(bit1));
-        table[0].x *= BETA_2;
-        let t = ConditionallySelectable::conditional_select(
-            &table[0],
-            &-table[0],
-            Choice::from(-s2 as u8),
-        );
-        G1Projective::conditional_select(&(acc - t), &acc, Choice::from(bit2))
+        let t = match VARTIME {
+            true if s1 == -1 => -table[0],
+            true => table[0],
+            false => ConditionallySelectable::conditional_select(
+                &table[0],
+                &-table[0],
+                Choice::from(-s1 as u8),
+            ),
+        };
+        acc = match VARTIME {
+            true if bit1 == 1 => acc,
+            true => acc - t,
+            false => G1Projective::conditional_select(&(acc - t), &acc, Choice::from(bit1))
+        };
+        table[0].x *= BETA_2.vartime::<VARTIME>();
+        let t = match VARTIME {
+            true if s2 == -1 => -table[0],
+            true => table[0],
+            false => ConditionallySelectable::conditional_select(
+                &table[0],
+                &-table[0],
+                Choice::from(-s2 as u8),
+            ),
+        };
+        match VARTIME {
+            true if bit2 == 1 => acc,
+            true => acc - t,
+            false => G1Projective::conditional_select(&(acc - t), &acc, Choice::from(bit2)),
+        }
     }
 
     /// Multiply `self` by `crate::BLS_X`, using double and add.
-    fn mul_by_x<const VARTIME: bool>(&self) -> G1Projective {
+    fn mul_by_x(&self) -> Self {
         let mut xself = G1Projective::identity();
         // NOTE: in BLS12-381 we can just skip the first bit.
         let mut x = crate::BLS_X >> 1;
         let mut tmp = *self;
         while x != 0 {
-            tmp = tmp.double::<VARTIME>();
+            tmp = tmp.double();
 
             if x % 2 == 1 {
                 xself += tmp;
@@ -1018,13 +1097,13 @@ impl G1Projective {
     /// Multiplies by $(1 - z)$, where $z$ is the parameter of BLS12-381, which
     /// [suffices to clear](https://ia.cr/2019/403) the cofactor and map
     /// elliptic curve points to elements of $\mathbb{G}\_1$.
-    pub fn clear_cofactor<const VARTIME: bool>(&self) -> G1Projective {
-        self - self.mul_by_x::<VARTIME>()
+    pub fn clear_cofactor(&self) -> Self {
+        self - self.mul_by_x()
     }
 
     /// Converts a batch of `G1Projective` elements into `G1Affine` elements. This
     /// function will panic if `p.len() != q.len()`.
-    pub fn batch_normalize(p: &[Self], q: &mut [G1Affine]) {
+    pub fn batch_normalize(p: &[Self], q: &mut [G1Affine<VARTIME>]) {
         assert_eq!(p.len(), q.len());
 
         let mut acc = Fp::one();
@@ -1059,27 +1138,14 @@ impl G1Projective {
         }
     }
 
-    /// Returns true if this element is the identity (the point at infinity).
-    #[inline]
-    pub fn is_identity(&self) -> Choice {
-        self.z.is_zero()
-    }
-
-    /// Returns true if this element is the identity (the point at infinity).
-    #[inline]
-    pub fn is_identity_vartime(&self) -> bool {
-        self.z.is_zero_vartime()
-    }
-
     /// Returns true if this point is on the curve. This should always return
     /// true unless an "unchecked" API was used.
     pub fn is_on_curve(&self) -> Choice {
         // Y^2 Z = X^3 + b Z^3
-
-        let lhs = self.y.square::<false>() * self.z;
-        let rhs = (self.x.square::<false>().mul_unreduced(&self.x)
-            + self.z.square::<false>().mul_unreduced(&(self.z * B)))
-        .montgomery_reduce::<false>();
+        let lhs = MulOp::mul(&MontOp::montgomery_reduce(&SquareOp::square(&self.y)), &self.z).montgomery_reduce_full();
+        let x_3 = MulOp::mul(&MontOp::montgomery_reduce(&SquareOp::square(&self.x)), &self.x);
+        let bz_3 = MulOp::mul(&MontOp::montgomery_reduce(&MulOp::mul(&MontOp::montgomery_reduce(&SquareOp::square(&self.z)), &self.z)), &B.vartime::<VARTIME>());
+        let rhs = Ops::add(&x_3, &bz_3).montgomery_reduce_full();
         lhs.ct_eq(&rhs) | self.z.is_zero()
     }
 }
@@ -1181,14 +1247,14 @@ impl Group for G1Projective {
             let flip_sign = rng.next_u32() % 2 != 0;
 
             // Obtain the corresponding y-coordinate given x as y = sqrt(x^3 + 4)
-            let p = ((x.square::<false>() * x) + B).sqrt().map(|y| G1Affine {
+            let p = ((x.square() * x) + B).sqrt().map(|y| G1Affine {
                 x,
                 y: if flip_sign { -y } else { y },
                 infinity: 0.into(),
             });
 
             if p.is_some().into() {
-                let p = p.unwrap().to_curve().clear_cofactor::<false>();
+                let p = p.unwrap().to_curve().clear_cofactor();
 
                 if bool::from(!p.is_identity()) {
                     return p;
@@ -1211,7 +1277,7 @@ impl Group for G1Projective {
 
     #[must_use]
     fn double(&self) -> Self {
-        self.double::<false>()
+        self.double()
     }
 }
 
@@ -1320,6 +1386,9 @@ impl UncompressedEncoding for G1Affine {
         G1Uncompressed(self.to_uncompressed())
     }
 }
+#[cfg(test)]
+mod test {
+    use super::*;
 
 #[test]
 fn test_beta() {
@@ -1339,12 +1408,12 @@ fn test_beta() {
 }
 #[test]
 fn test_is_on_curve() {
-    assert!(bool::from(G1Affine::identity().is_on_curve()));
-    assert!(bool::from(G1Affine::generator().is_on_curve()));
-    assert!(bool::from(G1Projective::identity().is_on_curve()));
-    assert!(bool::from(G1Projective::generator().is_on_curve()));
+    assert!(bool::from(G1Affine::<false>::identity().is_on_curve()));
+    assert!(bool::from(G1Affine::<false>::generator().is_on_curve()));
+    assert!(bool::from(G1Projective::<false>::identity().is_on_curve()));
+    assert!(bool::from(G1Projective::<false>::generator().is_on_curve()));
 
-    let z = Fp::from_raw_unchecked([
+    let z: Fp = Fp::from_raw_unchecked([
         0xba7a_fa1f_9a6f_e250,
         0xfa0f_5b59_5eaf_e731,
         0x3bdc_4776_94c3_06e7,
@@ -1353,7 +1422,7 @@ fn test_is_on_curve() {
         0x12b1_08ac_3364_3c3e,
     ]);
 
-    let gen = G1Affine::generator();
+    let gen: G1Affine = G1Affine::generator();
     let mut test = G1Projective {
         x: gen.x * z,
         y: gen.y * z,
@@ -1369,7 +1438,7 @@ fn test_is_on_curve() {
 #[test]
 #[allow(clippy::eq_op)]
 fn test_affine_point_equality() {
-    let a = G1Affine::generator();
+    let a: G1Affine = G1Affine::generator();
     let b = G1Affine::identity();
 
     assert!(a == a);
@@ -1381,7 +1450,7 @@ fn test_affine_point_equality() {
 #[test]
 #[allow(clippy::eq_op)]
 fn test_projective_point_equality() {
-    let a = G1Projective::generator();
+    let a: G1Projective = G1Projective::generator();
     let b = G1Projective::identity();
 
     assert!(a == a);
@@ -1428,7 +1497,7 @@ fn test_projective_point_equality() {
 
 #[test]
 fn test_conditionally_select_affine() {
-    let a = G1Affine::generator();
+    let a: G1Affine = G1Affine::generator();
     let b = G1Affine::identity();
 
     assert_eq!(G1Affine::conditional_select(&a, &b, Choice::from(0u8)), a);
@@ -1437,7 +1506,7 @@ fn test_conditionally_select_affine() {
 
 #[test]
 fn test_conditionally_select_projective() {
-    let a = G1Projective::generator();
+    let a: G1Projective = G1Projective::generator();
     let b = G1Projective::identity();
 
     assert_eq!(
@@ -1452,8 +1521,8 @@ fn test_conditionally_select_projective() {
 
 #[test]
 fn test_projective_to_affine() {
-    let a = G1Projective::generator();
-    let b = G1Projective::identity();
+    let a: G1Projective = G1Projective::generator();
+    let b: G1Projective = G1Projective::identity();
 
     assert!(bool::from(G1Affine::from(a).is_on_curve()));
     assert!(!bool::from(G1Affine::from(a).is_identity()));
@@ -1480,8 +1549,8 @@ fn test_projective_to_affine() {
 
 #[test]
 fn test_affine_to_projective() {
-    let a = G1Affine::generator();
-    let b = G1Affine::identity();
+    let a: G1Affine = G1Affine::generator();
+    let b: G1Affine = G1Affine::identity();
 
     assert!(bool::from(G1Projective::from(a).is_on_curve()));
     assert!(!bool::from(G1Projective::from(a).is_identity()));
@@ -1492,12 +1561,12 @@ fn test_affine_to_projective() {
 #[test]
 fn test_doubling() {
     {
-        let tmp = G1Projective::identity().double::<false>();
+        let tmp: G1Projective = G1Projective::identity().double();
         assert!(bool::from(tmp.is_identity()));
         assert!(bool::from(tmp.is_on_curve()));
     }
     {
-        let tmp = G1Projective::generator().double::<false>();
+        let tmp: G1Projective = G1Projective::generator().double();
         assert!(!bool::from(tmp.is_identity()));
         assert!(bool::from(tmp.is_on_curve()));
 
@@ -1529,14 +1598,14 @@ fn test_doubling() {
 #[test]
 fn test_projective_addition() {
     {
-        let a = G1Projective::identity();
-        let b = G1Projective::identity();
+        let a: G1Projective = G1Projective::identity();
+        let b: G1Projective = G1Projective::identity();
         let c = a + b;
         assert!(bool::from(c.is_identity()));
         assert!(bool::from(c.is_on_curve()));
     }
     {
-        let a = G1Projective::identity();
+        let a: G1Projective = G1Projective::identity();
         let mut b = G1Projective::generator();
         {
             let z = Fp::from_raw_unchecked([
@@ -1560,7 +1629,7 @@ fn test_projective_addition() {
         assert!(c == G1Projective::generator());
     }
     {
-        let a = G1Projective::identity();
+        let a: G1Projective = G1Projective::identity();
         let mut b = G1Projective::generator();
         {
             let z = Fp::from_raw_unchecked([
@@ -1584,8 +1653,8 @@ fn test_projective_addition() {
         assert!(c == G1Projective::generator());
     }
     {
-        let a = G1Projective::generator().double::<false>().double::<false>(); // 4P
-        let b = G1Projective::generator().double::<false>(); // 2P
+        let a: G1Projective = G1Projective::generator().double().double(); // 4P
+        let b = G1Projective::generator().double(); // 2P
         let c = a + b;
 
         let mut d = G1Projective::generator();
@@ -1601,7 +1670,7 @@ fn test_projective_addition() {
 
     // Degenerate case
     {
-        let beta = Fp::from_raw_unchecked([
+        let beta: Fp = Fp::from_raw_unchecked([
             0xcd03_c9e4_8671_f071,
             0x5dab_2246_1fcd_a5d2,
             0x5870_42af_d385_1b95,
@@ -1609,8 +1678,8 @@ fn test_projective_addition() {
             0x03f9_7d6e_83d0_50d2,
             0x18f0_2065_5463_8741,
         ]);
-        let beta = beta.square::<false>();
-        let a = G1Projective::generator().double::<false>().double::<false>();
+        let beta = beta.square();
+        let a = G1Projective::generator().double().double();
         let b = G1Projective {
             x: a.x * beta,
             y: -a.y,
@@ -1650,15 +1719,15 @@ fn test_projective_addition() {
 #[test]
 fn test_mixed_addition() {
     {
-        let a = G1Affine::identity();
-        let b = G1Projective::identity();
+        let a: G1Affine = G1Affine::identity();
+        let b: G1Projective = G1Projective::identity();
         let c = a + b;
         assert!(bool::from(c.is_identity()));
         assert!(bool::from(c.is_on_curve()));
     }
     {
-        let a = G1Affine::identity();
-        let mut b = G1Projective::generator();
+        let a: G1Affine = G1Affine::identity();
+        let mut b: G1Projective = G1Projective::generator();
         {
             let z = Fp::from_raw_unchecked([
                 0xba7a_fa1f_9a6f_e250,
@@ -1681,7 +1750,7 @@ fn test_mixed_addition() {
         assert!(c == G1Projective::generator());
     }
     {
-        let a = G1Affine::identity();
+        let a: G1Affine = G1Affine::identity();
         let mut b = G1Projective::generator();
         {
             let z = Fp::from_raw_unchecked([
@@ -1705,8 +1774,8 @@ fn test_mixed_addition() {
         assert!(c == G1Projective::generator());
     }
     {
-        let a = G1Projective::generator().double::<false>().double::<false>(); // 4P
-        let b = G1Projective::generator().double::<false>(); // 2P
+        let a: G1Projective = G1Projective::generator().double().double(); // 4P
+        let b = G1Projective::generator().double(); // 2P
         let c = a + b;
 
         let mut d = G1Projective::generator();
@@ -1722,7 +1791,7 @@ fn test_mixed_addition() {
 
     // Degenerate case
     {
-        let beta = Fp::from_raw_unchecked([
+        let beta: Fp = Fp::from_raw_unchecked([
             0xcd03_c9e4_8671_f071,
             0x5dab_2246_1fcd_a5d2,
             0x5870_42af_d385_1b95,
@@ -1730,8 +1799,8 @@ fn test_mixed_addition() {
             0x03f9_7d6e_83d0_50d2,
             0x18f0_2065_5463_8741,
         ]);
-        let beta = beta.square::<false>();
-        let a = G1Projective::generator().double::<false>().double::<false>();
+        let beta = beta.square();
+        let a = G1Projective::generator().double().double();
         let b = G1Projective {
             x: a.x * beta,
             y: -a.y,
@@ -1772,21 +1841,21 @@ fn test_mixed_addition() {
 #[test]
 #[allow(clippy::eq_op)]
 fn test_projective_negation_and_subtraction() {
-    let a = G1Projective::generator().double::<false>();
+    let a: G1Projective = G1Projective::generator().double();
     assert_eq!(a + (-a), G1Projective::identity());
     assert_eq!(a + (-a), a - a);
 }
 
 #[test]
 fn test_affine_negation_and_subtraction() {
-    let a = G1Affine::generator();
+    let a: G1Affine = G1Affine::generator();
     assert_eq!(G1Projective::from(a) + (-a), G1Projective::identity());
     assert_eq!(G1Projective::from(a) + (-a), G1Projective::from(a) - a);
 }
 
 #[test]
 fn test_projective_scalar_multiplication() {
-    let g = G1Projective::generator();
+    let g: G1Projective = G1Projective::generator();
     let a = Scalar::from_raw([
         0x2b56_8297_a56d_a71c,
         0xd8c3_9ecb_0ef3_75d1,
@@ -1806,7 +1875,7 @@ fn test_projective_scalar_multiplication() {
 
 #[test]
 fn test_affine_scalar_multiplication() {
-    let g = G1Affine::generator();
+    let g: G1Affine = G1Affine::generator();
     let a = Scalar::from_raw([
         0x2b56_8297_a56d_a71c,
         0xd8c3_9ecb_0ef3_75d1,
@@ -1826,7 +1895,7 @@ fn test_affine_scalar_multiplication() {
 
 #[test]
 fn test_is_torsion_free() {
-    let a = G1Affine {
+    let a: G1Affine = G1Affine {
         x: Fp::from_raw_unchecked([
             0x0aba_f895_b97e_43c8,
             0xba4c_6432_eb9b_61b0,
@@ -1847,36 +1916,36 @@ fn test_is_torsion_free() {
     };
     assert!(!bool::from(a.is_torsion_free()));
 
-    assert!(bool::from(G1Affine::identity().is_torsion_free()));
-    assert!(bool::from(G1Affine::generator().is_torsion_free()));
+    assert!(bool::from(G1Affine::<false>::identity().is_torsion_free()));
+    assert!(bool::from(G1Affine::<false>::generator().is_torsion_free()));
 }
 
 #[test]
 fn test_mul_by_x() {
     // multiplying by `x` a point in G1 is the same as multiplying by
     // the equivalent scalar.
-    let generator = G1Projective::generator();
+    let generator: G1Projective = G1Projective::generator();
     let x = if crate::BLS_X_IS_NEGATIVE {
         -Scalar::from(crate::BLS_X)
     } else {
         Scalar::from(crate::BLS_X)
     };
-    assert_eq!(generator.mul_by_x::<false>(), generator * x);
+    assert_eq!(generator.mul_by_x(), generator * x);
 
     let point = G1Projective::generator() * Scalar::from(42);
-    assert_eq!(point.mul_by_x::<false>(), point * x);
+    assert_eq!(point.mul_by_x(), point * x);
 }
 
 #[test]
 fn test_clear_cofactor() {
     // the generator (and the identity) are always on the curve,
     // even after clearing the cofactor
-    let generator = G1Projective::generator();
-    assert!(bool::from(generator.clear_cofactor::<false>().is_on_curve()));
-    let id = G1Projective::identity();
-    assert!(bool::from(id.clear_cofactor::<false>().is_on_curve()));
+    let generator: G1Projective = G1Projective::generator();
+    assert!(bool::from(generator.clear_cofactor().is_on_curve()));
+    let id: G1Projective = G1Projective::identity();
+    assert!(bool::from(id.clear_cofactor().is_on_curve()));
 
-    let z = Fp::from_raw_unchecked([
+    let z: Fp = Fp::from_raw_unchecked([
         0x3d2d1c670671394e,
         0x0ee3a800a2f7c1ca,
         0x270f4f21da2e5050,
@@ -1902,26 +1971,26 @@ fn test_clear_cofactor() {
             0xb0c8cfbe9dc8fdc1,
             0x1328661767ef368b,
         ]),
-        z: z.square::<false>() * z,
+        z: z.square() * z,
     };
 
     assert!(bool::from(point.is_on_curve()));
     assert!(!bool::from(G1Affine::from(point).is_torsion_free()));
-    let cleared_point = point.clear_cofactor::<false>();
+    let cleared_point = point.clear_cofactor();
     assert!(bool::from(cleared_point.is_on_curve()));
     assert!(bool::from(G1Affine::from(cleared_point).is_torsion_free()));
 
     // in BLS12-381 the cofactor in G1 can be
     // cleared multiplying by (1-x)
     let h_eff = Scalar::from(1) + Scalar::from(crate::BLS_X);
-    assert_eq!(point.clear_cofactor::<false>(), point * h_eff);
+    assert_eq!(point.clear_cofactor(), point * h_eff);
 }
 
 #[test]
 fn test_batch_normalize() {
-    let a = G1Projective::generator().double::<false>();
-    let b = a.double::<false>();
-    let c = b.double::<false>();
+    let a: G1Projective = G1Projective::generator().double();
+    let b = a.double();
+    let c = b.double();
 
     for a_identity in (0..=1).map(|n| n == 1) {
         for b_identity in (0..=1).map(|n| n == 1) {
@@ -1980,7 +2049,7 @@ fn test_zeroize() {
 
 #[test]
 fn test_commutative_scalar_subgroup_multiplication() {
-    let a = Scalar::from_raw([
+    let a: Scalar = Scalar::from_raw([
         0x1fff_3231_233f_fffd,
         0x4884_b7fa_0003_4802,
         0x998c_4fef_ecbc_4ff3,
@@ -2003,4 +2072,30 @@ fn test_commutative_scalar_subgroup_multiplication() {
     // By value.
     assert_eq!(g1_p * a, a * g1_p);
     assert_eq!(g1_a * a, a * g1_a);
+}
+
+#[test]
+fn test_zero_double() {
+    use rand_core::SeedableRng;
+    let mut rng = rand_xorshift::XorShiftRng::from_seed([
+        0x57, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
+        0xbc, 0xe5,
+    ]);
+
+    let one: Fp::<0, true> = Fp::one();
+    let valv = -mul_by_3b(mul_by_3b::<true>(one.double() + one));
+
+    for _ in 0..1_000_000 {
+        let r = G1Projective{
+            x: Fp::<0, true>::random(&mut rng),
+            y: Fp::zero(),
+            z: one,
+        }.double();
+
+        assert!(r.x.is_zero_vartime());
+        assert_eq!(r.y, valv);
+        assert!(r.z.is_zero_vartime());
+    }
+}
+    
 }

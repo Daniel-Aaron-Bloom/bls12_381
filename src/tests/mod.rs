@@ -18,8 +18,8 @@ macro_rules! test_vectors {
                 expected = &expected[len_of_encoding..];
                 let decoded = $affine::$deserialize(&decoded).unwrap();
                 assert_eq!(e_affine, decoded);
-
-                e = &e + &$projective::generator();
+                let g: $projective = $projective::generator();
+                e = &e + &g;
             }
         }
 
@@ -94,7 +94,7 @@ fn test_pairing_result_against_relic() {
     0F41E58663BF08CF 068672CBD01A7EC7 3BACA4D72CA93544 DEFF686BFD6DF543 D48EAA24AFE47E1E FDE449383B676631
     */
 
-    let a = G1Affine::generator();
+    let a: G1Affine = G1Affine::generator();
     let b = G2Affine::generator();
 
     use super::fp::Fp;

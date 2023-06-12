@@ -6,30 +6,135 @@ use rand_core::RngCore;
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 
 use crate::fp::Fp;
+use crate::util::{Mag, Never, OtherMag, Ops, DoubleOp};
+
+pub mod wide;
+use wide::Fp2Wide;
 
 #[derive(Copy, Clone)]
-pub struct Fp2 {
-    pub c0: Fp,
-    pub c1: Fp,
+pub struct Fp2<const MAGNITUDE: usize = 0, const VARTIME: bool = false> {
+    pub c0: Fp<MAGNITUDE, VARTIME>,
+    pub c1: Fp<MAGNITUDE, VARTIME>,
 }
 
-impl fmt::Debug for Fp2 {
+impl<const MAGNITUDE: usize, const VARTIME: bool> OtherMag for Fp2<MAGNITUDE, VARTIME> {
+    type Mag<const MAG2: usize> = Fp2<MAG2, VARTIME>;
+}
+
+pub trait MirrorMag<Other> {
+    type Mag;
+}
+
+impl<T> MirrorMag<Never> for T {
+    type Mag = Never;
+}
+impl<const MAG1: usize, const MAG2: usize, const VARTIME: bool> MirrorMag<Fp<MAG2, VARTIME>> for Fp2<MAG1, VARTIME> {
+    type Mag = Fp2<MAG2, VARTIME>;
+}
+
+impl<const MAGNITUDE: usize, const VARTIME: bool> Mag<2, [u64; 6]> for Fp2<MAGNITUDE, VARTIME>
+where Fp<MAGNITUDE, VARTIME>: Mag<1, [u64; 6]>,
+Self: MirrorMag<<Fp<MAGNITUDE, VARTIME> as Mag<1, [u64; 6]>>::Prev>,
+Self: MirrorMag<<Fp<MAGNITUDE, VARTIME> as Mag<1, [u64; 6]>>::Next>,
+<Self as MirrorMag<<Fp<MAGNITUDE, VARTIME> as Mag<1, [u64; 6]>>::Prev>>::Mag: Mag<2, [u64; 6]>,
+<Self as MirrorMag<<Fp<MAGNITUDE, VARTIME> as Mag<1, [u64; 6]>>::Next>>::Mag: Mag<2, [u64; 6]>,
+{
+    type Prev = <Self as MirrorMag<<Fp<MAGNITUDE, VARTIME> as Mag<1, [u64; 6]>>::Prev>>::Mag;
+    type Next = <Self as MirrorMag<<Fp<MAGNITUDE, VARTIME> as Mag<1, [u64; 6]>>::Next>>::Mag;
+    const MODULUS: [u64; 6] = unimplemented!();
+
+    #[inline(always)]
+    fn make([c0, c1]: [[u64; 6]; 2]) -> Self {
+        Self{ c0: Mag::make([c0]), c1: Mag::make([c1]) }
+    }
+    #[inline(always)]
+    fn data(&self) -> [&[u64; 6]; 2] {
+        [self.c0.data()[0], self.c1.data()[0]]
+    }
+    #[inline(always)]
+    fn negate(&self) -> Self {
+        Self {
+            c0: self.c0.neg(),
+            c1: self.c1.neg(),
+        }
+    }
+}
+
+// impl<const MAG2: usize, const VARTIME: bool> Ops<2, [u64; 6], MAG2> for Fp2<0, VARTIME>
+// where Fp<MAG2, VARTIME>: Mag<1, [u64; 6]>,
+//     Fp2<MAG2, VARTIME>: Mag<2, [u64; 6]>,
+// {
+//     type OpOut = <Fp2<MAG2, VARTIME> as Mag<2, [u64; 6]>>::Next;
+//     #[inline(always)]
+//     fn add(lhs: &Self, rhs: &Fp2<MAG2, VARTIME>) -> Self::OpOut {
+//         Mag::make([
+//             *Ops::add(&lhs.c0, &rhs.c0).data()[0],
+//             *Ops::add(&lhs.c1, &rhs.c1).data()[0],
+//         ])
+//     }
+//     #[inline(always)]
+//     fn sub(lhs: &Self, rhs: &Fp2<MAG2, VARTIME>) -> Self::OpOut {
+//         Mag::make([
+//             *Ops::sub(&lhs.c0, &rhs.c0).data()[0],
+//             *Ops::sub(&lhs.c1, &rhs.c1).data()[0],
+//         ])
+//     }
+// }
+
+impl<const MAG1: usize, const MAG2: usize, const VARTIME: bool> Ops<2, [u64; 6], MAG2> for Fp2<MAG1, VARTIME>
+where Fp<MAG1, VARTIME>: Ops<1, [u64; 6], MAG2>,
+    <Fp<MAG1, VARTIME> as OtherMag>::Mag<MAG2>: Mag<1, [u64; 6]>,
+    Fp2<MAG2, VARTIME>: Mag<2, [u64; 6]>,
+{
+    type OpOut = <Fp2<MAG2, VARTIME> as Mag<2, [u64; 6]>>::Next;
+    #[inline(always)]
+    fn add(lhs: &Self, rhs: &Fp2<MAG2, VARTIME>) -> Self::OpOut {
+        Mag::make([
+            *Ops::add(&lhs.c0, &Mag::make([rhs.c0.0])).data()[0],
+            *Ops::add(&lhs.c1, &Mag::make([rhs.c1.0])).data()[0],
+        ])
+    }
+    #[inline(always)]
+    fn sub(lhs: &Self, rhs: &Fp2<MAG2, VARTIME>) -> Self::OpOut {
+        Mag::make([
+            *Ops::sub(&lhs.c0, &Mag::make([rhs.c0.0])).data()[0],
+            *Ops::sub(&lhs.c1, &Mag::make([rhs.c1.0])).data()[0],
+        ])
+    }
+}
+
+impl<const POW: usize, const MAGNITUDE: usize, const VARTIME: bool> DoubleOp<POW> for Fp2<MAGNITUDE, VARTIME>
+where Fp<MAGNITUDE, VARTIME>: DoubleOp<POW>,
+<Fp<MAGNITUDE, VARTIME> as DoubleOp<POW>>::DoubleOut: Mag<1, [u64; 6]>,
+Self: MirrorMag<<Fp<MAGNITUDE, VARTIME> as DoubleOp<POW>>::DoubleOut>,
+<Self as MirrorMag<<Fp<MAGNITUDE, VARTIME> as DoubleOp<POW>>::DoubleOut>>::Mag: Mag<2, [u64; 6]>
+{
+    type DoubleOut = <Self as MirrorMag<<Fp<MAGNITUDE, VARTIME> as DoubleOp<POW>>::DoubleOut>>::Mag;
+    fn double(lhs: &Self) -> Self::DoubleOut {
+        Mag::make([
+            *DoubleOp::<POW>::double(&lhs.c0).data()[0],
+            *DoubleOp::<POW>::double(&lhs.c1).data()[0],
+        ])
+    }
+}
+
+impl<const MAGNITUDE: usize, const VARTIME: bool> fmt::Debug for Fp2<MAGNITUDE, VARTIME> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:?} + {:?}*u", self.c0, self.c1)
     }
 }
 
-impl Default for Fp2 {
+impl<const MAGNITUDE: usize, const VARTIME: bool> Default for Fp2<MAGNITUDE, VARTIME> {
     fn default() -> Self {
-        Fp2::zero()
+        Self::zero()
     }
 }
 
 #[cfg(feature = "zeroize")]
-impl zeroize::DefaultIsZeroes for Fp2 {}
+impl<const MAGNITUDE: usize = 0, const VARTIME: bool = false> zeroize::DefaultIsZeroes for Fp2<MAGNITUDE, VARTIME> {}
 
-impl From<Fp> for Fp2 {
-    fn from(f: Fp) -> Fp2 {
+impl<const MAGNITUDE: usize, const VARTIME: bool> From<Fp<MAGNITUDE, VARTIME>> for Fp2<MAGNITUDE, VARTIME> {
+    fn from(f: Fp<MAGNITUDE, VARTIME>) -> Self {
         Fp2 {
             c0: f,
             c1: Fp::zero(),
@@ -37,21 +142,25 @@ impl From<Fp> for Fp2 {
     }
 }
 
-impl ConstantTimeEq for Fp2 {
+impl<const MAGNITUDE: usize, const VARTIME: bool> ConstantTimeEq for Fp2<MAGNITUDE, VARTIME> {
     fn ct_eq(&self, other: &Self) -> Choice {
         self.c0.ct_eq(&other.c0) & self.c1.ct_eq(&other.c1)
     }
 }
 
-impl Eq for Fp2 {}
-impl PartialEq for Fp2 {
+impl<const MAGNITUDE: usize, const VARTIME: bool> Eq for Fp2<MAGNITUDE, VARTIME> {}
+impl<const MAGNITUDE: usize, const VARTIME: bool> PartialEq for Fp2<MAGNITUDE, VARTIME> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        bool::from(self.ct_eq(other))
+        if VARTIME {
+            self.c0 == other.c0 && self.c1 == other.c1
+        } else {
+            bool::from(self.ct_eq(other))
+        }
     }
 }
 
-impl ConditionallySelectable for Fp2 {
+impl<const MAGNITUDE: usize, const VARTIME: bool> ConditionallySelectable for Fp2<MAGNITUDE, VARTIME> {
     fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
         Fp2 {
             c0: Fp::conditional_select(&a.c0, &b.c0, choice),
@@ -60,20 +169,20 @@ impl ConditionallySelectable for Fp2 {
     }
 }
 
-impl<'a> Neg for &'a Fp2 {
-    type Output = Fp2;
+impl<'a, const MAGNITUDE: usize, const VARTIME: bool> Neg for &'a Fp2<MAGNITUDE, VARTIME> {
+    type Output = Fp2<MAGNITUDE, VARTIME>;
 
     #[inline]
-    fn neg(self) -> Fp2 {
-        self.neg::<false>()
+    fn neg(self) -> Fp2<MAGNITUDE, VARTIME> {
+        self.neg()
     }
 }
 
-impl Neg for Fp2 {
-    type Output = Fp2;
+impl<const MAGNITUDE: usize, const VARTIME: bool> Neg for Fp2<MAGNITUDE, VARTIME> {
+    type Output = Self;
 
     #[inline]
-    fn neg(self) -> Fp2 {
+    fn neg(self) -> Self {
         -&self
     }
 }
@@ -83,7 +192,7 @@ impl<'a, 'b> Sub<&'b Fp2> for &'a Fp2 {
 
     #[inline]
     fn sub(self, rhs: &'b Fp2) -> Fp2 {
-        self.sub::<false>(rhs)
+        self.sub(rhs)
     }
 }
 
@@ -92,7 +201,7 @@ impl<'a, 'b> Add<&'b Fp2> for &'a Fp2 {
 
     #[inline]
     fn add(self, rhs: &'b Fp2) -> Fp2 {
-        self.add::<false>(rhs)
+        self.add(rhs)
     }
 }
 
@@ -101,16 +210,16 @@ impl<'a, 'b> Mul<&'b Fp2> for &'a Fp2 {
 
     #[inline]
     fn mul(self, rhs: &'b Fp2) -> Fp2 {
-        self.mul::<false>(rhs)
+        self.mul(rhs)
     }
 }
 
 impl_binops_additive!(Fp2, Fp2);
 impl_binops_multiplicative!(Fp2, Fp2);
 
-impl Fp2 {
+impl<const MAGNITUDE: usize, const VARTIME: bool> Fp2<MAGNITUDE, VARTIME> {
     #[inline]
-    pub const fn zero() -> Fp2 {
+    pub const fn zero() -> Self {
         Fp2 {
             c0: Fp::zero(),
             c1: Fp::zero(),
@@ -118,72 +227,58 @@ impl Fp2 {
     }
 
     #[inline]
-    pub const fn one() -> Fp2 {
+    pub const fn one() -> Self {
         Fp2 {
             c0: Fp::one(),
             c1: Fp::zero(),
         }
     }
 
+    #[inline]
+    pub const fn eq_vartime(&self, rhs: &Self) -> bool {
+        self.c0.eq_vartime(&rhs.c0) && self.c1.eq_vartime(&rhs.c1)
+    }
+
+    #[inline]
     pub fn is_zero(&self) -> Choice {
         self.c0.is_zero() & self.c1.is_zero()
     }
 
-    pub fn is_zero_vartime(&self) -> bool {
+    #[inline]
+    pub const fn is_zero_vartime(&self) -> bool {
         self.c0.is_zero_vartime() & self.c1.is_zero_vartime()
     }
 
-    pub(crate) fn random(mut rng: impl RngCore) -> Fp2 {
+    #[inline(always)]
+    pub const fn conjugate(&self) -> Self {
         Fp2 {
-            c0: Fp::random(&mut rng),
-            c1: Fp::random(&mut rng),
+            c0: self.c0,
+            c1: self.c1.neg(),
         }
     }
 
     /// Raises this element to p.
     #[inline(always)]
-    pub fn frobenius_map<const VARTIME: bool>(&self) -> Self {
+    pub const fn frobenius_map(&self) -> Self {
         // This is always just a conjugation. If you're curious why, here's
         // an article about it: https://alicebob.cryptoland.net/the-frobenius-endomorphism-with-finite-fields/
-        self.conjugate::<VARTIME>()
+        self.conjugate()
     }
 
     #[inline(always)]
-    pub fn conjugate<const VARTIME: bool>(&self) -> Self {
-        Fp2 {
-            c0: self.c0,
-            c1: (&self.c1).neg::<VARTIME>(),
-        }
-    }
-
-    #[inline(always)]
-    pub fn mul_by_nonresidue<const VARTIME: bool>(&self) -> Fp2 {
+    pub const fn mul_by_nonresidue(&self) -> Self {
         // Multiply a + bu by u + 1, getting
         // au + a + bu^2 + bu
         // and because u^2 = -1, we get
         // (a - b) + (a + b)u
 
         Fp2 {
-            c0: (&self.c0).sub::<VARTIME>(&self.c1),
-            c1: (&self.c0).add::<VARTIME>(&self.c1),
+            c0: self.c0.sub(&self.c1),
+            c1: self.c0.add(&self.c1),
         }
     }
 
-    /// Returns whether or not this element is strictly lexicographically
-    /// larger than its negation.
-    #[inline]
-    pub fn lexicographically_largest(&self) -> Choice {
-        // If this element's c1 coefficient is lexicographically largest
-        // then it is lexicographically largest. Otherwise, in the event
-        // the c1 coefficient is zero and the c0 coefficient is
-        // lexicographically largest, then this element is lexicographically
-        // largest.
-
-        self.c1.lexicographically_largest()
-            | (self.c1.is_zero() & self.c0.lexicographically_largest())
-    }
-
-    pub const fn square<const VARTIME: bool>(&self) -> Fp2 {
+    pub const fn square(&self) -> Self {
         // Complex squaring:
         //
         // v0  = c0 * c1
@@ -196,17 +291,17 @@ impl Fp2 {
         // c0' = (c0 + c1) * (c0 - c1)
         // c1' = 2 * c0 * c1
 
-        let a = (&self.c0).add::<VARTIME>(&self.c1);
-        let b = (&self.c0).sub::<VARTIME>(&self.c1);
-        let c = (&self.c0).add::<VARTIME>(&self.c0);
+        let a = (&self.c0).add(&self.c1);
+        let b = (&self.c0).sub(&self.c1);
+        let c = (&self.c0).add(&self.c0);
 
         Fp2 {
-            c0: (&a).mul::<VARTIME>(&b),
-            c1: (&c).mul::<VARTIME>(&self.c1),
+            c0: a.mul(&b),
+            c1: c.mul(&self.c1),
         }
     }
 
-    pub fn mul<const VARTIME: bool>(&self, rhs: &Fp2) -> Fp2 {
+    pub const fn mul(&self, rhs: &Self) -> Self {
         // F_{p^2} x F_{p^2} multiplication implemented with operand scanning (schoolbook)
         // computes the result as:
         //
@@ -220,122 +315,50 @@ impl Fp2 {
         // Each of these is a "sum of products", which we can compute efficiently.
 
         Fp2 {
-            c0: Fp::sum_of_products::<2, VARTIME>([self.c0, -self.c1], [rhs.c0, rhs.c1]),
-            c1: Fp::sum_of_products::<2, VARTIME>([self.c0, self.c1], [rhs.c1, rhs.c0]),
+            c0: Fp::sum_of_products([self.c0, self.c1.neg()], [rhs.c0, rhs.c1]),
+            c1: Fp::sum_of_products([self.c0, self.c1], [rhs.c1, rhs.c0]),
         }
     }
 
-    pub const fn add<const VARTIME: bool>(&self, rhs: &Fp2) -> Fp2 {
+    pub const fn add(&self, rhs: &Self) -> Self {
         Fp2 {
-            c0: (&self.c0).add::<VARTIME>(&rhs.c0),
-            c1: (&self.c1).add::<VARTIME>(&rhs.c1),
+            c0: (&self.c0).add(&rhs.c0),
+            c1: (&self.c1).add(&rhs.c1),
         }
     }
 
-    pub const fn sub<const VARTIME: bool>(&self, rhs: &Fp2) -> Fp2 {
+    pub const fn sub(&self, rhs: &Self) -> Self {
         Fp2 {
-            c0: (&self.c0).sub::<VARTIME>(&rhs.c0),
-            c1: (&self.c1).sub::<VARTIME>(&rhs.c1),
+            c0: (&self.c0).sub(&rhs.c0),
+            c1: (&self.c1).sub(&rhs.c1),
         }
     }
 
-    pub const fn neg<const VARTIME: bool>(&self) -> Fp2 {
+    pub const fn neg(&self) -> Self {
         Fp2 {
-            c0: (&self.c0).neg::<VARTIME>(),
-            c1: (&self.c1).neg::<VARTIME>(),
+            c0: (&self.c0).neg(),
+            c1: (&self.c1).neg(),
         }
-    }
-
-    pub fn sqrt(&self) -> CtOption<Self> {
-        // Algorithm 9, https://eprint.iacr.org/2012/685.pdf
-        // with constant time modifications.
-
-        CtOption::new(Fp2::zero(), self.is_zero()).or_else(|| {
-            // a1 = self^((p - 3) / 4)
-            let a1 = self.pow_vartime(&[
-                0xee7f_bfff_ffff_eaaa,
-                0x07aa_ffff_ac54_ffff,
-                0xd9cc_34a8_3dac_3d89,
-                0xd91d_d2e1_3ce1_44af,
-                0x92c6_e9ed_90d2_eb35,
-                0x0680_447a_8e5f_f9a6,
-            ]);
-
-            // alpha = a1^2 * self = self^((p - 3) / 2 + 1) = self^((p - 1) / 2)
-            let alpha = a1.square::<false>() * self;
-
-            // x0 = self^((p + 1) / 4)
-            let x0 = a1 * self;
-
-            // In the event that alpha = -1, the element is order p - 1 and so
-            // we're just trying to get the square of an element of the subfield
-            // Fp. This is given by x0 * u, since u = sqrt(-1). Since the element
-            // x0 = a + bu has b = 0, the solution is therefore au.
-            CtOption::new(
-                Fp2 {
-                    c0: -x0.c1,
-                    c1: x0.c0,
-                },
-                alpha.ct_eq(&(&Fp2::one()).neg::<false>()),
-            )
-            // Otherwise, the correct solution is (1 + alpha)^((q - 1) // 2) * x0
-            .or_else(|| {
-                CtOption::new(
-                    (alpha + Fp2::one()).pow_vartime(&[
-                        0xdcff_7fff_ffff_d555,
-                        0x0f55_ffff_58a9_ffff,
-                        0xb398_6950_7b58_7b12,
-                        0xb23b_a5c2_79c2_895f,
-                        0x258d_d3db_21a5_d66b,
-                        0x0d00_88f5_1cbf_f34d,
-                    ]) * x0,
-                    Choice::from(1),
-                )
-            })
-            // Only return the result if it's really the square root (and so
-            // self is actually quadratic nonresidue)
-            .and_then(|sqrt| CtOption::new(sqrt, sqrt.square::<false>().ct_eq(self)))
-        })
-    }
-
-    /// Computes the multiplicative inverse of this field
-    /// element, returning None in the case that this element
-    /// is zero.
-    pub fn invert(&self) -> CtOption<Self> {
-        // We wish to find the multiplicative inverse of a nonzero
-        // element a + bu in Fp2. We leverage an identity
-        //
-        // (a + bu)(a - bu) = a^2 + b^2
-        //
-        // which holds because u^2 = -1. This can be rewritten as
-        //
-        // (a + bu)(a - bu)/(a^2 + b^2) = 1
-        //
-        // because a^2 + b^2 = 0 has no nonzero solutions for (a, b).
-        // This gives that (a - bu)/(a^2 + b^2) is the inverse
-        // of (a + bu). Importantly, this can be computing using
-        // only a single inversion in Fp.
-
-        (self.c0.square_unreduced() + self.c1.square_unreduced())
-            .montgomery_reduce::<false>()
-            .invert()
-            .map(|t| Fp2 {
-                c0: self.c0 * t,
-                c1: self.c1 * -t,
-            })
     }
 
     /// Although this is labeled "vartime", it is only
     /// variable time with respect to the exponent. It
     /// is also not exposed in the public API.
-    pub fn pow_vartime(&self, by: &[u64; 6]) -> Self {
+    pub const fn pow_vartime(&self, by: &[u64; 6]) -> Self {
         let mut res = Self::one();
-        for e in by.iter().rev() {
-            for i in (0..64).rev() {
-                res = res.square::<true>();
+        // for e in by.iter().rev() {
+        let mut e_i = by.len();
+        while e_i > 0 {
+            e_i -= 1;
+            let e = &by[e_i];
+            // for i in (0..64).rev() {
+            let mut i = 64;
+            while i > 0 {
+                i -= 1;
+                res = res.square();
 
                 if ((*e >> i) & 1) == 1 {
-                    res *= self;
+                    res = res.mul(self);
                 }
             }
         }
@@ -360,9 +383,111 @@ impl Fp2 {
     }
 }
 
+impl Fp2 {
+    pub(crate) fn random(mut rng: impl RngCore) -> Fp2 {
+        Fp2 {
+            c0: Fp::random(&mut rng),
+            c1: Fp::random(&mut rng),
+        }
+    }
+
+    /// Returns whether or not this element is strictly lexicographically
+    /// larger than its negation.
+    #[inline]
+    pub fn lexicographically_largest(&self) -> Choice {
+        // If this element's c1 coefficient is lexicographically largest
+        // then it is lexicographically largest. Otherwise, in the event
+        // the c1 coefficient is zero and the c0 coefficient is
+        // lexicographically largest, then this element is lexicographically
+        // largest.
+
+        self.c1.lexicographically_largest()
+            | (self.c1.is_zero() & self.c0.lexicographically_largest())
+    }
+
+    pub fn sqrt(&self) -> CtOption<Self> {
+        // Algorithm 9, https://eprint.iacr.org/2012/685.pdf
+        // with constant time modifications.
+
+        CtOption::new(Fp2::zero(), self.is_zero()).or_else(|| {
+            // a1 = self^((p - 3) / 4)
+            let a1 = self.pow_vartime(&[
+                0xee7f_bfff_ffff_eaaa,
+                0x07aa_ffff_ac54_ffff,
+                0xd9cc_34a8_3dac_3d89,
+                0xd91d_d2e1_3ce1_44af,
+                0x92c6_e9ed_90d2_eb35,
+                0x0680_447a_8e5f_f9a6,
+            ]);
+
+            // alpha = a1^2 * self = self^((p - 3) / 2 + 1) = self^((p - 1) / 2)
+            let alpha = a1.square() * self;
+
+            // x0 = self^((p + 1) / 4)
+            let x0 = a1 * self;
+
+            // In the event that alpha = -1, the element is order p - 1 and so
+            // we're just trying to get the square of an element of the subfield
+            // Fp. This is given by x0 * u, since u = sqrt(-1). Since the element
+            // x0 = a + bu has b = 0, the solution is therefore au.
+            CtOption::new(
+                Fp2 {
+                    c0: -x0.c1,
+                    c1: x0.c0,
+                },
+                alpha.ct_eq(&(&Fp2::one()).neg()),
+            )
+            // Otherwise, the correct solution is (1 + alpha)^((q - 1) // 2) * x0
+            .or_else(|| {
+                CtOption::new(
+                    (alpha + Fp2::one()).pow_vartime(&[
+                        0xdcff_7fff_ffff_d555,
+                        0x0f55_ffff_58a9_ffff,
+                        0xb398_6950_7b58_7b12,
+                        0xb23b_a5c2_79c2_895f,
+                        0x258d_d3db_21a5_d66b,
+                        0x0d00_88f5_1cbf_f34d,
+                    ]) * x0,
+                    Choice::from(1),
+                )
+            })
+            // Only return the result if it's really the square root (and so
+            // self is actually quadratic nonresidue)
+            .and_then(|sqrt| CtOption::new(sqrt, sqrt.square().ct_eq(self)))
+        })
+    }
+
+    /// Computes the multiplicative inverse of this field
+    /// element, returning None in the case that this element
+    /// is zero.
+    pub fn invert(&self) -> CtOption<Self> {
+        // We wish to find the multiplicative inverse of a nonzero
+        // element a + bu in Fp2. We leverage an identity
+        //
+        // (a + bu)(a - bu) = a^2 + b^2
+        //
+        // which holds because u^2 = -1. This can be rewritten as
+        //
+        // (a + bu)(a - bu)/(a^2 + b^2) = 1
+        //
+        // because a^2 + b^2 = 0 has no nonzero solutions for (a, b).
+        // This gives that (a - bu)/(a^2 + b^2) is the inverse
+        // of (a + bu). Importantly, this can be computing using
+        // only a single inversion in Fp.
+
+        (self.c0.square_wide() + self.c1.square_wide())
+            .montgomery_reduce_full()
+            .invert()
+            .map(|t| Fp2 {
+                c0: self.c0 * t,
+                c1: self.c1 * -t,
+            })
+    }
+}
+
 #[test]
 fn test_conditional_selection() {
-    let a = Fp2 {
+    let a: Fp2 = Fp2 {
         c0: Fp::from_raw_unchecked([1, 2, 3, 4, 5, 6]),
         c1: Fp::from_raw_unchecked([7, 8, 9, 10, 11, 12]),
     };
@@ -428,7 +553,7 @@ fn test_equality() {
 
 #[test]
 fn test_squaring() {
-    let a = Fp2 {
+    let a: Fp2 = Fp2 {
         c0: Fp::from_raw_unchecked([
             0xc9a2_1831_63ee_70d4,
             0xbc37_70a7_196b_5c91,
@@ -465,7 +590,7 @@ fn test_squaring() {
         ]),
     };
 
-    assert_eq!(a.square::<false>(), b);
+    assert_eq!(a.square(), b);
 }
 
 #[test]
@@ -650,7 +775,7 @@ fn test_subtraction() {
 
 #[test]
 fn test_negation() {
-    let a = Fp2 {
+    let a: Fp2 = Fp2 {
         c0: Fp::from_raw_unchecked([
             0xc9a2_1831_63ee_70d4,
             0xbc37_70a7_196b_5c91,
@@ -712,7 +837,7 @@ fn test_sqrt() {
         ]),
     };
 
-    assert_eq!(a.sqrt().unwrap().square::<false>(), a);
+    assert_eq!(a.sqrt().unwrap().square(), a);
 
     // b = 5, which is a generator of the p - 1 order
     // multiplicative subgroup
@@ -728,7 +853,7 @@ fn test_sqrt() {
         c1: Fp::zero(),
     };
 
-    assert_eq!(b.sqrt().unwrap().square::<false>(), b);
+    assert_eq!(b.sqrt().unwrap().square(), b);
 
     // c = 25, which is a generator of the (p - 1) / 2 order
     // multiplicative subgroup
@@ -744,7 +869,7 @@ fn test_sqrt() {
         c1: Fp::zero(),
     };
 
-    assert_eq!(c.sqrt().unwrap().square::<false>(), c);
+    assert_eq!(c.sqrt().unwrap().square(), c);
 
     // 2155129644831861015726826462986972654175647013268275306775721078997042729172900466542651176384766902407257452753362*u + 2796889544896299244102912275102369318775038861758288697415827248356648685135290329705805931514906495247464901062529
     // is nonsquare.

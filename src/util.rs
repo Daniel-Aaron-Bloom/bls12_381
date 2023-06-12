@@ -129,9 +129,9 @@ macro_rules! impl_binops_additive_output {
         impl_add_binop!($lhs, $rhs);
         impl_sub_binop!($lhs, $rhs);
     };
-    ({$($gen:tt)*} {where $($wc:tt)+} {$($lhs:tt)+} {$($rhs:tt)+}) => {
-        impl_add_binop!({$($gen)*} {where $($wc)+} {$($lhs)+} {$($rhs)+});
-        impl_sub_binop!({$($gen)*} {where $($wc)+} {$($lhs)+} {$($rhs)+});
+    ({$($gen:tt)*} {$(where $($wc:tt)+)?} {$($lhs:tt)+} {$($rhs:tt)+}) => {
+        impl_add_binop!({$($gen)*} {$(where $($wc)+)?} {$($lhs)+} {$($rhs)+});
+        impl_sub_binop!({$($gen)*} {$(where $($wc)+)?} {$($lhs)+} {$($rhs)+});
     };
 }
 
@@ -164,58 +164,188 @@ macro_rules! impl_binops_multiplicative_mixed {
             }
         }
     };
+    ({$($gen:tt)*} {$(where $($wc:tt)+)?} {$($lhs:tt)+} {$($rhs:tt)+} {$($output:tt)+}) => {
+        impl<'b, $($gen)*> Mul<&'b $($rhs)+> for $($lhs)+
+        $(where $($wc)+)? {
+            type Output = $($output)+;
+
+            #[inline]
+            fn mul(self, rhs: &'b $($rhs)+) -> $($output)+
+            $(where $($wc)+)? {
+                &self * rhs
+            }
+        }
+
+        impl<'a, $($gen)*> Mul<$($rhs)+> for &'a $($lhs)+
+        $(where $($wc)+)? {
+            type Output = $($output)+;
+
+            #[inline]
+            fn mul(self, rhs: $($rhs)+) -> $($output)+ {
+                self * &rhs
+            }
+        }
+
+        impl<$($gen)*> Mul<$($rhs)+> for $($lhs)+
+        $(where $($wc)+)? {
+            type Output = $($output)+;
+
+            #[inline]
+            fn mul(self, rhs: $($rhs)+) -> $($output)+ {
+                &self * &rhs
+            }
+        }
+    };
 }
 
 macro_rules! impl_binops_additive {
     ($lhs:ident, $rhs:ident) => {
-        impl_binops_additive_output!($lhs, $rhs);
+        impl_binops_additive!{{} {} {$lhs} {$rhs}}
+    };
+    ({$($gen:tt)*} {$(where $($wc:tt)+)?} {$($lhs:tt)+} {$($rhs:tt)+}) => {
+        impl_binops_additive_output!({$($gen)*} {$(where $($wc)+)?} {$($lhs)+} {$($rhs)+});
 
-        impl SubAssign<$rhs> for $lhs {
+        impl<$($gen)*> SubAssign<$($rhs)+> for $($lhs)+
+        $(where $($wc)+)? {
             #[inline]
-            fn sub_assign(&mut self, rhs: $rhs) {
+            fn sub_assign(&mut self, rhs: $($rhs)+) {
                 *self = &*self - &rhs;
             }
         }
 
-        impl AddAssign<$rhs> for $lhs {
+        impl<$($gen)*> AddAssign<$($rhs)+> for $($lhs)+
+        $(where $($wc)+)? {
             #[inline]
-            fn add_assign(&mut self, rhs: $rhs) {
+            fn add_assign(&mut self, rhs: $($rhs)+) {
                 *self = &*self + &rhs;
             }
         }
 
-        impl<'b> SubAssign<&'b $rhs> for $lhs {
+        impl<'b, $($gen)*> SubAssign<&'b $($rhs)+> for $($lhs)+
+        $(where $($wc)+)? {
             #[inline]
-            fn sub_assign(&mut self, rhs: &'b $rhs) {
+            fn sub_assign(&mut self, rhs: &'b $($rhs)+) {
                 *self = &*self - rhs;
             }
         }
 
-        impl<'b> AddAssign<&'b $rhs> for $lhs {
+        impl<'b, $($gen)*> AddAssign<&'b $($rhs)+> for $($lhs)+
+        $(where $($wc)+)? {
             #[inline]
-            fn add_assign(&mut self, rhs: &'b $rhs) {
+            fn add_assign(&mut self, rhs: &'b $($rhs)+) {
                 *self = &*self + rhs;
             }
         }
-    };
+    }
 }
 
 macro_rules! impl_binops_multiplicative {
     ($lhs:ident, $rhs:ident) => {
-        impl_binops_multiplicative_mixed!($lhs, $rhs, $lhs);
+        impl_binops_multiplicative!{{} {} {$lhs} {$rhs}}
+    };
+    ({$($gen:tt)*} {$(where $($wc:tt)+)?} {$($lhs:tt)+} {$($rhs:tt)+}) => {
+        impl_binops_multiplicative_mixed!({$($gen)*} {$(where $($wc)+)?} {$($lhs)+} {$($rhs)+} {$($lhs)+});
 
-        impl MulAssign<$rhs> for $lhs {
+        impl<$($gen)*> MulAssign<$($rhs)+> for $($lhs)+ {
             #[inline]
-            fn mul_assign(&mut self, rhs: $rhs) {
+            fn mul_assign(&mut self, rhs: $($rhs)+) {
                 *self = &*self * &rhs;
             }
         }
 
-        impl<'b> MulAssign<&'b $rhs> for $lhs {
+        impl<'b, $($gen)*> MulAssign<&'b $($rhs)+> for $($lhs)+ {
             #[inline]
-            fn mul_assign(&mut self, rhs: &'b $rhs) {
+            fn mul_assign(&mut self, rhs: &'b $($rhs)+) {
                 *self = &*self * rhs;
             }
         }
-    };
+    }
+}
+
+
+// Hack to get the ! type on stable
+#[doc(hidden)]
+pub trait HasOutput {
+    type Output;
+}
+impl<O> HasOutput for fn() -> O {
+    type Output = O;
+}
+pub type Never = <fn() -> ! as HasOutput>::Output;
+
+#[doc(hidden)]
+pub trait NonZero {}
+
+#[doc(hidden)]
+pub trait OtherMag {
+    type Mag<const MAGNITUDE: usize>: OtherMag;
+}
+
+#[doc(hidden)]
+pub trait Mag<const ELEMS: usize, Data>: Sized {
+    type Prev: Mag<ELEMS, Data>;
+    type Next: Mag<ELEMS, Data>;
+
+    /// A multiple of the prime that is larger than this element could be
+    const MODULUS: Data;
+
+    fn make(v: [Data; ELEMS]) -> Self;
+    fn data(&self) -> [&Data; ELEMS];
+    /// Negates an element by subtracting it from the `Self::MODULUS`
+    fn negate(&self) -> Self;
+}
+
+impl OtherMag for Never {
+    type Mag<const MAGNITUDE: usize> = Never;
+}
+
+impl<const ELEMS: usize, Data> Mag<ELEMS, Data> for Never {
+    type Prev = Never;
+    type Next = Never;
+
+    const MODULUS: Data = unimplemented!();
+
+    #[inline(always)]
+    fn make(_: [Data; ELEMS]) -> Self {
+        unimplemented!()
+    }
+    #[inline(always)]
+    fn data(&self) -> [&Data; ELEMS] {
+        unreachable!()
+    }
+    #[inline(always)]
+    fn negate(&self) -> Self {
+        unreachable!()
+    }
+}
+
+pub trait Ops<const ELEMS: usize, Data, const MAG: usize>: OtherMag {
+    type OpOut: Mag<ELEMS, Data>;
+    fn add(lhs: &Self, rhs: &Self::Mag<MAG>) -> Self::OpOut;
+    fn sub(lhs: &Self, rhs: &Self::Mag<MAG>) -> Self::OpOut;
+}
+
+pub trait DoubleOp<const POW: usize = 0> {
+    type DoubleOut;
+    fn double(lhs: &Self) -> Self::DoubleOut;
+}
+
+pub trait MontOp {
+    type MontOut;
+    fn montgomery_reduce(lhs: &Self) -> Self::MontOut;
+}
+
+pub trait MulOp<const MAG: usize>: OtherMag {
+    type MulOut;
+    fn mul(lhs: &Self, rhs: &Self::Mag<MAG>) -> Self::MulOut;
+}
+
+pub trait SquareOp: OtherMag {
+    type SquareOut;
+    fn square(lhs: &Self) -> Self::SquareOut;
+}
+
+
+trait Vartime {
+
 }
