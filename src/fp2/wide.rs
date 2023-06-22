@@ -1,6 +1,9 @@
-use crate::{fp::wide::FpWide, util::{MulOp, SquareOp, Ops, OtherMag}};
+use core::fmt;
+use subtle::{Choice, ConstantTimeEq};
 
-use super::Fp2;
+use crate::{fp::wide::{FpWide, FpAWide, FpWideReduce}, util::{OtherMag, FpWideMagnitude, RawMagnitude, Timing}};
+
+use super::{Fp2A};
 
 #[derive(Copy, Clone)]
 pub struct Fp2Wide<const MAGNITUDE: usize, const VARTIME: bool> {
@@ -8,42 +11,65 @@ pub struct Fp2Wide<const MAGNITUDE: usize, const VARTIME: bool> {
     pub c1: FpWide<MAGNITUDE, VARTIME>,
 }
 
+#[derive(Copy, Clone)]
+pub struct Fp2AWide<Mag0: FpWideMagnitude, Mag1: FpWideMagnitude, T: Timing> {
+    pub c0: FpAWide<Mag0, T>,
+    pub c1: FpAWide<Mag1, T>,
+}
+
 impl<const MAGNITUDE: usize, const VARTIME: bool> OtherMag for Fp2Wide<MAGNITUDE, VARTIME> {
+    const MAGNITUDE: usize = MAGNITUDE;
     type Mag<const MAG2: usize> = Fp2Wide<MAG2, VARTIME>;
 }
 
-macro_rules! mul_helper {
-    ($ua:literal {$($ub:literal)*}) => {
-// $(
-// impl<const VARTIME: bool> MulOp<[u64; 6], $ub> for Fp2<$ua, VARTIME> {
-//     type MulOut = Fp2Wide<{($ua+1)*($ub+1)-1}, VARTIME>;
-//     fn mul(lhs: &Self, rhs: &Self::Mag<$ub>) -> Self::MulOut {
-//         Fp2Wide(mul_wide(&lhs.0, &rhs.0))
-//     }
-// })*
-impl<const VARTIME: bool> SquareOp<(Fp<$ua, VARTIME>, Fp<$ua, VARTIME>)> for Fp2<$ua, VARTIME> {
-    type SquareOut = Fp2Wide<{($ua+1)*($ua+1)-1}, VARTIME>;
-    fn square(lhs: &Self) -> Self::SquareOut {
-        let a = Ops::add(&lhs.c0, &lhs.c1);
-        let b = Ops::sub(&lhs.c0, &lhs.c1);
-        let c = Ops::add(&lhs.c0, &lhs.c0);
+impl<Mag0: FpWideMagnitude, Mag1: FpWideMagnitude, T: Timing> fmt::Debug for Fp2AWide<Mag0, Mag1, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?} + {:?}*u", self.c0, self.c1)
+    }
+}
 
-        Fp2Wide {
-            c0: MulOp::mul(&a, &b),
-            c1: MulOp::mul(&c, &lhs.c1),
+impl<Mag0: FpWideMagnitude, Mag1: FpWideMagnitude, T: Timing> ConstantTimeEq for Fp2AWide<Mag0, Mag1, T> {
+    fn ct_eq(&self, other: &Self) -> Choice {
+        self.c0.ct_eq(&other.c0) & self.c1.ct_eq(&other.c1)
+    }
+}
+
+impl<Mag0: FpWideMagnitude, Mag1: FpWideMagnitude, T: Timing> Eq for Fp2AWide<Mag0, Mag1, T> {}
+impl<Mag0: FpWideMagnitude, Mag1: FpWideMagnitude, T: Timing> PartialEq for Fp2AWide<Mag0, Mag1, T> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        if T::VAR {
+            self.c0 == other.c0 && self.c1 == other.c1
+        } else {
+            bool::from(self.ct_eq(other))
         }
     }
 }
-    };
-    ({$($ua:literal)*} $ub:tt) => {$(
-        mul_helper!{$ua $ub}
-    )*};
-}
 
-macro_rules! mul_impl {
-    ($($($ua:literal),+ $(,)?)?) => {
-        mul_helper!{{$($($ua)+)?} {$($($ua)+)?}}
-    };
-}
+impl<Mag0: FpWideMagnitude, Mag1: FpWideMagnitude, T: Timing> Fp2AWide<Mag0, Mag1, T> {
 
-// mul_impl!{0,1,2,3,4,5,6,7,8}
+    #[inline(always)]
+    pub const fn vartime<T2: Timing>(self) -> Fp2AWide<Mag0, Mag1, T2> {
+        Fp2AWide{
+            c0: self.c0.vartime(),
+            c1: self.c1.vartime(),
+        }
+    }
+
+    #[inline(always)]
+    pub const fn mag<MagR0, MagR1>(self) -> Fp2AWide<MagR0, MagR1, T>
+    where MagR0: FpWideMagnitude, MagR1: FpWideMagnitude {
+        Fp2AWide{
+            c0: self.c0.mag(),
+            c1: self.c1.mag(),
+        }
+    }
+
+    pub const fn montgomery_reduce(&self) -> Fp2A<FpWideReduce<Mag0>, FpWideReduce<Mag1>, T> {
+        let v = (Mag0::MAG, Mag1::MAG, FpWideReduce::<Mag0>::MAG, FpWideReduce::<Mag1>::MAG);
+        Fp2A {
+            c0: self.c0.montgomery_reduce(),
+            c1: self.c1.montgomery_reduce(),
+        }
+    }
+}

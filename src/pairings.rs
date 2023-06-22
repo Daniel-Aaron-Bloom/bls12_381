@@ -7,16 +7,50 @@ use crate::{G1Affine, G1Projective, G2Affine, G2Projective, Scalar, BLS_X, BLS_X
 use core::borrow::Borrow;
 use core::fmt;
 use core::iter::Sum;
-use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub};
 use group::Group;
 use pairing::{Engine, PairingCurveAffine};
 use rand_core::RngCore;
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 
-#[cfg(feature = "alloc")]
-use alloc::vec::Vec;
-#[cfg(feature = "alloc")]
 use pairing::MultiMillerLoop;
+
+/// This is a "generic" implementation of the Miller loop to avoid duplicating code
+/// structure elsewhere; instead, we'll write concrete instantiations of
+/// `MillerLoopDriver` for whatever purposes we need (such as caching modes).
+macro_rules! miller_loop {
+    (<$d:ty> $driver:expr) => {{
+        let mut driver = $driver;
+        let mut f = <$d>::one();
+
+        let mut found_one = false;
+        let mut b = 64;
+        while b > 0 {
+            b -= 1;
+            let i = (((BLS_X >> 1) >> b) & 1) == 1;
+            if !found_one {
+                found_one = i;
+                continue;
+            }
+
+            (driver, f) = driver.doubling_step(f);
+    
+            if i {
+                (driver, f) = driver.addition_step(f);
+            }
+    
+            f = <$d>::square_output(f);
+        }
+
+        (driver, f) = driver.doubling_step(f);
+    
+        if BLS_X_IS_NEGATIVE {
+            f = <$d>::conjugate(f);
+        }
+    
+        (driver, f)
+    }};
+}
 
 /// Represents results of a Miller loop, one of the most expensive portions
 /// of the pairing function. `MillerLoopResult`s cannot be compared with each
@@ -484,8 +518,7 @@ impl Group for Gt {
     }
 }
 
-#[cfg(feature = "alloc")]
-#[cfg_attr(docsrs, doc(cfg(all(feature = "pairings", feature = "alloc"))))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "pairings"))))]
 #[derive(Clone, Debug)]
 /// This structure contains cached computations pertaining to a $\mathbb{G}_2$
 /// element as part of the pairing function (specifically, the Miller loop) and
@@ -494,47 +527,53 @@ impl Group for Gt {
 /// conjunction with the [`multi_miller_loop`](crate::multi_miller_loop)
 /// function provided by this crate.
 ///
-/// Requires the `alloc` and `pairing` crate features to be enabled.
+/// Requires the `pairing` crate features to be enabled.
 pub struct G2Prepared {
     infinity: Choice,
-    coeffs: Vec<(Fp2, Fp2, Fp2)>,
+    coeffs: [(Fp2, Fp2, Fp2); 68],
 }
 
-#[cfg(feature = "alloc")]
 impl From<G2Affine> for G2Prepared {
     fn from(q: G2Affine) -> G2Prepared {
         struct Adder {
             cur: G2Projective,
             base: G2Affine,
-            coeffs: Vec<(Fp2, Fp2, Fp2)>,
+            coeffs: [(Fp2, Fp2, Fp2); 68],
+            coeffs_i: usize,
         }
 
-        impl MillerLoopDriver for Adder {
-            type Output = ();
+        impl Adder {
+        // impl MillerLoopDriver for Adder {
+        //     type Output = ();
 
-            fn doubling_step(&mut self, _: Self::Output) -> Self::Output {
+            fn doubling_step(mut self, _: ()) -> (Self, ()) {
                 let coeffs = doubling_step::<false>(&mut self.cur);
-                self.coeffs.push(coeffs);
+                self.coeffs[self.coeffs_i] = coeffs;
+                self.coeffs_i += 1;
+                (self, ())
             }
-            fn addition_step(&mut self, _: Self::Output) -> Self::Output {
+            fn addition_step(mut self, _: ()) -> (Self, ()) {
                 let coeffs = addition_step::<false>(&mut self.cur, &self.base);
-                self.coeffs.push(coeffs);
+                self.coeffs[self.coeffs_i] = coeffs;
+                self.coeffs_i += 1;
+                (self, ())
             }
-            fn square_output(_: Self::Output) -> Self::Output {}
-            fn conjugate(_: Self::Output) -> Self::Output {}
-            fn one() -> Self::Output {}
+            const fn square_output(_: ()) -> () {}
+            const fn conjugate(_: ()) -> () {}
+            const fn one() -> () {}
         }
 
         let is_identity = q.is_identity();
         let q = G2Affine::conditional_select(&q, &G2Affine::generator(), is_identity);
 
-        let mut adder = Adder {
+        let adder = Adder {
             cur: G2Projective::from(q),
             base: q,
-            coeffs: Vec::with_capacity(68),
+            coeffs: [(Fp2::zero(), Fp2::zero(), Fp2::zero()); 68],
+            coeffs_i: 0,
         };
 
-        miller_loop(&mut adder);
+        let (adder, _) = miller_loop!(<Adder> adder);
 
         assert_eq!(adder.coeffs.len(), 68);
 
@@ -545,12 +584,11 @@ impl From<G2Affine> for G2Prepared {
     }
 }
 
-#[cfg(feature = "alloc")]
-#[cfg_attr(docsrs, doc(cfg(all(feature = "pairings", feature = "alloc"))))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "pairings"))))]
 /// Computes $$\sum_{i=1}^n \textbf{ML}(a_i, b_i)$$ given a series of terms
 /// $$(a_1, b_1), (a_2, b_2), ..., (a_n, b_n).$$
 ///
-/// Requires the `alloc` and `pairing` crate features to be enabled.
+/// Requires the `pairing` crate features to be enabled.
 pub fn multi_miller_loop(terms: &[(&G1Affine, &G2Prepared)]) -> MillerLoopResult {
     struct Adder<'a, 'b, 'c> {
         terms: &'c [(&'a G1Affine, &'b G2Prepared)],
@@ -560,7 +598,7 @@ pub fn multi_miller_loop(terms: &[(&G1Affine, &G2Prepared)]) -> MillerLoopResult
     impl<'a, 'b, 'c> MillerLoopDriver for Adder<'a, 'b, 'c> {
         type Output = Fp12;
 
-        fn doubling_step(&mut self, mut f: Self::Output) -> Self::Output {
+        fn doubling_step(mut self, mut f: Self::Output) -> (Self, Self::Output) {
             let index = self.index;
             for term in self.terms {
                 let either_identity = term.0.is_identity() | term.1.infinity;
@@ -570,9 +608,9 @@ pub fn multi_miller_loop(terms: &[(&G1Affine, &G2Prepared)]) -> MillerLoopResult
             }
             self.index += 1;
 
-            f
+            (self, f)
         }
-        fn addition_step(&mut self, mut f: Self::Output) -> Self::Output {
+        fn addition_step(mut self, mut f: Self::Output) -> (Self, Self::Output) {
             let index = self.index;
             for term in self.terms {
                 let either_identity = term.0.is_identity() | term.1.infinity;
@@ -582,7 +620,7 @@ pub fn multi_miller_loop(terms: &[(&G1Affine, &G2Prepared)]) -> MillerLoopResult
             }
             self.index += 1;
 
-            f
+            (self, f)
         }
         fn square_output(f: Self::Output) -> Self::Output {
             f.square::<false>()
@@ -597,7 +635,7 @@ pub fn multi_miller_loop(terms: &[(&G1Affine, &G2Prepared)]) -> MillerLoopResult
 
     let mut adder = Adder { terms, index: 0 };
 
-    let tmp = miller_loop(&mut adder);
+    let tmp = miller_loop(adder);
 
     MillerLoopResult(tmp)
 }
@@ -614,13 +652,15 @@ pub fn pairing<const VARTIME: bool>(p: &G1Affine, q: &G2Affine) -> Gt {
     impl<const VARTIME: bool> MillerLoopDriver for Adder<VARTIME> {
         type Output = Fp12;
 
-        fn doubling_step(&mut self, f: Self::Output) -> Self::Output {
+        fn doubling_step(mut self, f: Self::Output) -> (Self, Self::Output) {
             let coeffs = doubling_step::<VARTIME>(&mut self.cur);
-            ell::<VARTIME>(f, &coeffs, &self.p)
+            let f = ell::<VARTIME>(f, &coeffs, &self.p);
+            (self, f)
         }
-        fn addition_step(&mut self, f: Self::Output) -> Self::Output {
+        fn addition_step(mut self, f: Self::Output) -> (Self, Self::Output) {
             let coeffs = addition_step::<VARTIME>(&mut self.cur, &self.base);
-            ell::<VARTIME>(f, &coeffs, &self.p)
+            let f = ell::<VARTIME>(f, &coeffs, &self.p);
+            (self, f)
         }
         fn square_output(f: Self::Output) -> Self::Output {
             f.square::<VARTIME>()
@@ -637,13 +677,13 @@ pub fn pairing<const VARTIME: bool>(p: &G1Affine, q: &G2Affine) -> Gt {
     let p = G1Affine::conditional_select(p, &G1Affine::generator(), either_identity);
     let q = G2Affine::conditional_select(q, &G2Affine::generator(), either_identity);
 
-    let mut adder = Adder::<VARTIME> {
+    let adder = Adder::<VARTIME> {
         cur: G2Projective::from(q),
         base: q,
         p,
     };
 
-    let tmp = miller_loop(&mut adder);
+    let tmp = miller_loop(adder);
     let tmp = MillerLoopResult(Fp12::conditional_select(
         &tmp,
         &Fp12::one(),
@@ -652,11 +692,11 @@ pub fn pairing<const VARTIME: bool>(p: &G1Affine, q: &G2Affine) -> Gt {
     tmp.final_exponentiation::<VARTIME>()
 }
 
-trait MillerLoopDriver {
+trait MillerLoopDriver: Sized {
     type Output;
 
-    fn doubling_step(&mut self, f: Self::Output) -> Self::Output;
-    fn addition_step(&mut self, f: Self::Output) -> Self::Output;
+    fn doubling_step(self, f: Self::Output) -> (Self, Self::Output);
+    fn addition_step(self, f: Self::Output) -> (Self, Self::Output);
     fn square_output(f: Self::Output) -> Self::Output;
     fn conjugate(f: Self::Output) -> Self::Output;
     fn one() -> Self::Output;
@@ -665,32 +705,8 @@ trait MillerLoopDriver {
 /// This is a "generic" implementation of the Miller loop to avoid duplicating code
 /// structure elsewhere; instead, we'll write concrete instantiations of
 /// `MillerLoopDriver` for whatever purposes we need (such as caching modes).
-fn miller_loop<D: MillerLoopDriver>(driver: &mut D) -> D::Output {
-    let mut f = D::one();
-
-    let mut found_one = false;
-    for i in (0..64).rev().map(|b| (((BLS_X >> 1) >> b) & 1) == 1) {
-        if !found_one {
-            found_one = i;
-            continue;
-        }
-
-        f = driver.doubling_step(f);
-
-        if i {
-            f = driver.addition_step(f);
-        }
-
-        f = D::square_output(f);
-    }
-
-    f = driver.doubling_step(f);
-
-    if BLS_X_IS_NEGATIVE {
-        f = D::conjugate(f);
-    }
-
-    f
+fn miller_loop<D: MillerLoopDriver>(driver: D) -> D::Output {
+    miller_loop!(<D> driver).1
 }
 
 fn ell<const VARTIME: bool>(f: Fp12, coeffs: &(Fp2, Fp2, Fp2), p: &G1Affine) -> Fp12 {
@@ -813,7 +829,6 @@ impl pairing::MillerLoopResult for MillerLoopResult {
     }
 }
 
-#[cfg(feature = "alloc")]
 impl MultiMillerLoop for Bls12 {
     type G2Prepared = G2Prepared;
     type Result = MillerLoopResult;
@@ -866,7 +881,6 @@ fn test_unitary() {
     assert_eq!(q, r);
 }
 
-#[cfg(feature = "alloc")]
 #[test]
 fn test_multi_miller_loop() {
     let a1 = G1Affine::generator();

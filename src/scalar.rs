@@ -1,8 +1,9 @@
 //! This module provides an implementation of the BLS12-381 scalar field $\mathbb{F}_q$
 //! where `q = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001`
 
+use core::borrow::Borrow;
 use core::fmt;
-use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+use core::ops::{Add, Mul, MulAssign, Neg, Sub};
 use rand_core::RngCore;
 
 use ff::{Field, PrimeField};
@@ -11,7 +12,7 @@ use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 #[cfg(feature = "bits")]
 use ff::{FieldBits, PrimeFieldBits};
 
-use crate::util::{adc, mac, sbb, borrowing_sub, slc, OtherMag, Mag, Never, NonZero, Ops, DoubleOp};
+use crate::util::{adc, mac, sbb, borrowing_sub, slc, OtherMag, Mag, Never, NonZero, DoubleOp, Ops, copy_bytes};
 
 use self::wide::{square_wide, montgomery_reduce_wide, mul_wide};
 
@@ -41,14 +42,18 @@ const fn add(lhs: &[u64; 4], rhs: &[u64; 4]) -> ([u64; 4], bool) {
     ([d0, d1, d2, d3], carry != 0)
 }
 
-#[inline]
-const fn sub<const VARTIME: bool>(lhs: &[u64; 4], rhs: &[u64; 4], mut modulus: [u64; 4]) -> [u64; 4] {
+pub const fn sub_c(lhs: &[u64; 4], rhs: &[u64; 4]) -> ([u64; 4], bool) {
     let (r0, borrow) = borrowing_sub(lhs[0], rhs[0], false);
     let (r1, borrow) = borrowing_sub(lhs[1], rhs[1], borrow);
     let (r2, borrow) = borrowing_sub(lhs[2], rhs[2], borrow);
     let (r3, borrow) = borrowing_sub(lhs[3], rhs[3], borrow);
+    ([r0, r1, r2, r3], borrow)
+}
 
-    let v = [r0, r1, r2, r3];
+#[inline]
+const fn sub<const VARTIME: bool>(lhs: &[u64; 4], rhs: &[u64; 4], mut modulus: [u64; 4]) -> [u64; 4] {
+    let (v, borrow) = sub_c(lhs, rhs);
+
     match VARTIME {
         true if borrow => add(&v, &modulus).0,
         true => v,
@@ -122,6 +127,7 @@ pub struct Scalar<const MAGNITUDE: usize = 0, const VARTIME: bool = false>(pub(c
 
 
 impl<const MAGNITUDE: usize, const VARTIME: bool> OtherMag for Scalar<MAGNITUDE, VARTIME> {
+    const MAGNITUDE: usize = MAGNITUDE;
     type Mag<const MAG2: usize> = Scalar<MAG2, VARTIME>;
 }
 
@@ -169,8 +175,7 @@ impl<const VARTIME: bool> Mag<1, [u64; 4]> for Scalar<1, VARTIME> {
 }
 impl<const VARTIME: bool> NonZero for Scalar<1, VARTIME> {}
 
-
-impl<const MAG2: usize, const VARTIME: bool> Ops<1, [u64; 4], MAG2> for Scalar<0, VARTIME>
+impl<const MAG2: usize, const VARTIME: bool> Ops<1, [u64; 4], Scalar<MAG2, VARTIME>> for Scalar<0, VARTIME>
 where
     Scalar<MAG2, VARTIME>: Mag<1, [u64; 4]>,
 {
@@ -185,26 +190,20 @@ where
     }
 }
 
-impl<const MAG1: usize, const MAG2: usize, const VARTIME: bool> Ops<1, [u64; 4], MAG2> for Scalar<MAG1, VARTIME>
+impl<const MAG1: usize, const MAG2: usize, const VARTIME: bool> Ops<1, [u64; 4], Scalar<MAG2, VARTIME>> for Scalar<MAG1, VARTIME>
 where
     Scalar<MAG1, VARTIME>: Mag<1, [u64; 4]> + NonZero,
-    <Scalar<MAG1, VARTIME> as Mag<1, [u64; 4]>>::Prev: Ops<1, [u64; 4], MAG2>,
+    <Scalar<MAG1, VARTIME> as Mag<1, [u64; 4]>>::Prev: Ops<1, [u64; 4], Scalar<MAG2, VARTIME>>,
     Scalar<MAG2, VARTIME>: Mag<1, [u64; 4]>,
 {
     type OpOut =
-        <<<Scalar<MAG1, VARTIME> as Mag<1, [u64; 4]>>::Prev as Ops<1, [u64; 4], MAG2>>::OpOut as Mag<1, [u64; 4]>>::Next;
+        <<<Scalar<MAG1, VARTIME> as Mag<1, [u64; 4]>>::Prev as Ops<1, [u64; 4], Scalar<MAG2, VARTIME>>>::OpOut as Mag<1, [u64; 4]>>::Next;
     #[inline(always)]
-    fn add(lhs: &Self, rhs: &Self::Mag<MAG2>) -> Self::OpOut
-    where
-        Self::Mag<MAG2>: Mag<1, [u64; 4]>,
-    {
+    fn add(lhs: &Self, rhs: &Scalar<MAG2, VARTIME>) -> Self::OpOut {
         Mag::make([add(lhs.data()[0], rhs.data()[0]).0])
     }
     #[inline(always)]
-    fn sub(lhs: &Self, rhs: &Self::Mag<MAG2>) -> Self::OpOut
-    where
-        Self::Mag<MAG2>: Mag<1, [u64; 4]>,
-    {
+    fn sub(lhs: &Self, rhs: &Scalar<MAG2, VARTIME>) -> Self::OpOut {
         Mag::make([sub::<VARTIME>(&lhs.0, &rhs.data()[0], <Self::OpOut>::MODULUS)])
     }
 }
@@ -432,6 +431,23 @@ impl<const MAGNITUDE: usize, const VARTIME: bool> Scalar<MAGNITUDE, VARTIME> {
         Self(R.0)
     }
 
+    /// Selects between `f` and `t` based on `b`
+    pub const fn select(f: Self, t: Self, b: bool) -> Self {
+        match VARTIME {
+            true if b => t,
+            true => f,
+            false => {
+                let b = -(b as i64) as u64;
+                Self([
+                    (t.0[0] & b) | (f.0[0] & !b),
+                    (t.0[1] & b) | (f.0[1] & !b),
+                    (t.0[2] & b) | (f.0[2] & !b),
+                    (t.0[3] & b) | (f.0[3] & !b),
+                ])
+            }
+        }
+    }
+
     /// An integer `s` satisfying the equation `2^s * t = modulus - 1` with `t` odd.
     ///
     /// This is the number of leading zero bits in the little-endian bit representation of
@@ -444,7 +460,7 @@ impl<const MAGNITUDE: usize, const VARTIME: bool> Scalar<MAGNITUDE, VARTIME> {
     }
 
     /// Returns the `2^bits` root of unity.
-    pub fn omega(bits: u32) -> Self {
+    pub const fn omega(bits: u32) -> Self {
         // The pairing-friendly curve may not be able to support
         // large enough (radix2) evaluation domains.
         if bits >= Self::S {
@@ -489,16 +505,15 @@ impl<const MAGNITUDE: usize, const VARTIME: bool> Scalar<MAGNITUDE, VARTIME> {
 
     /// Converts an element of `Scalar` into a byte representation in
     /// little-endian byte order.
-    pub fn to_bytes(&self) -> [u8; 32] {
+    pub const fn to_bytes(&self) -> [u8; 32] {
         // Turn into canonical form by computing
         // (a.R) / R = a
         let tmp = self.montgomery_reduce();
 
-        let mut res = [0; 32];
-        res[0..8].copy_from_slice(&tmp[0].to_le_bytes());
-        res[8..16].copy_from_slice(&tmp[1].to_le_bytes());
-        res[16..24].copy_from_slice(&tmp[2].to_le_bytes());
-        res[24..32].copy_from_slice(&tmp[3].to_le_bytes());
+        let res = copy_bytes([0; 32], 0, tmp[0].to_le_bytes());
+        let res = copy_bytes(res, 8, tmp[1].to_le_bytes());
+        let res = copy_bytes(res, 16, tmp[2].to_le_bytes());
+        let res = copy_bytes(res, 24, tmp[3].to_le_bytes());
 
         res
     }
@@ -842,6 +857,33 @@ impl<const MAGNITUDE: usize, const VARTIME: bool> Scalar<MAGNITUDE, VARTIME> {
 
         CtOption::new(t0, !self.ct_eq(&Self::zero()))
     }
+
+    /// Inverts a batch of `Scalar` elements into `G1Affine` elements.
+    /// function will panic if `p.len() != q.len()`. Does not alter 'q[i]` when `p[i].is_zero()`.
+    pub fn invert_batch<P>(p: P, q: &mut [Self])
+    where P: DoubleEndedIterator+Clone, P::Item: Borrow<Self>{
+
+        let mut acc = Self::one();
+        for (p, q) in p.clone().zip(q.iter_mut()) {
+            let p = p.borrow();
+            *q = Scalar::conditional_select(&acc, q, p.is_zero());
+            acc = Scalar::conditional_select(&acc.mul(p), &acc, p.is_zero());
+        }
+
+        // This is the inverse, as all z-coordinates are nonzero and the ones
+        // that are not are skipped.
+        acc = acc.invert().unwrap();
+
+        for (p, q) in p.rev().zip(q.iter_mut().rev()) {
+            let p = p.borrow();
+
+            // Compute = 1/z
+            *q = Scalar::conditional_select(&acc.mul(q), q, p.is_zero());
+
+            // Cancel out z-coordinate in denominator of `acc`
+            acc = Scalar::conditional_select(&acc.mul(p), &acc, p.is_zero());
+        }
+    }
 }
 
 impl From<Scalar> for [u8; 32] {
@@ -938,14 +980,14 @@ impl<const VARTIME: bool> PrimeFieldBits for Scalar<0, VARTIME> {
 
         #[cfg(not(target_pointer_width = "64"))]
         let limbs = [
-            u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-            u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-            u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
-            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
-            u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            u32::from_le_bytes(be_bytes_to_u64[0..4].try_into().unwrap()),
+            u32::from_le_bytes(be_bytes_to_u64[4..8].try_into().unwrap()),
+            u32::from_le_bytes(be_bytes_to_u64[8..12].try_into().unwrap()),
+            u32::from_le_bytes(be_bytes_to_u64[12..16].try_into().unwrap()),
+            u32::from_le_bytes(be_bytes_to_u64[16..20].try_into().unwrap()),
+            u32::from_le_bytes(be_bytes_to_u64[20..24].try_into().unwrap()),
+            u32::from_le_bytes(be_bytes_to_u64[24..28].try_into().unwrap()),
+            u32::from_le_bytes(be_bytes_to_u64[28..32].try_into().unwrap()),
         ];
 
         #[cfg(target_pointer_width = "64")]
@@ -1284,16 +1326,16 @@ fn test_multiplication() {
             .flat_map(|byte| (0..8).rev().map(move |i| ((byte >> i) & 1u8) == 1u8))
         {
             let tmp3 = tmp2;
-            tmp2.add_assign(&tmp3);
+            tmp2 += &tmp3;
 
             if b {
-                tmp2.add_assign(&cur);
+                tmp2 += &cur;
             }
         }
 
         assert_eq!(tmp, tmp2);
 
-        cur.add_assign(&LARGEST);
+        cur += &LARGEST;
     }
 }
 
@@ -1313,21 +1355,27 @@ fn test_squaring() {
             .flat_map(|byte| (0..8).rev().map(move |i| ((byte >> i) & 1u8) == 1u8))
         {
             let tmp3 = tmp2;
-            tmp2.add_assign(&tmp3);
+            tmp2 += &tmp3;
 
             if b {
-                tmp2.add_assign(&cur);
+                tmp2 += &cur;
             }
         }
 
         assert_eq!(tmp, tmp2);
 
-        cur.add_assign(&LARGEST);
+        cur += &LARGEST;
     }
 }
 
 #[test]
 fn test_inversion() {
+    use rand_core::SeedableRng;
+    let mut rng = rand_xorshift::XorShiftRng::from_seed([
+        0x57, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
+        0xbc, 0xe5,
+    ]);
+
     assert!(bool::from(Scalar::<0, false>::zero().invert().is_none()));
     assert_eq!(Scalar::<0, false>::one().invert().unwrap(), Scalar::one());
     assert_eq!((-&Scalar::<0, false>::one()).invert().unwrap(), -&Scalar::one());
@@ -1340,8 +1388,22 @@ fn test_inversion() {
 
         assert_eq!(tmp2, Scalar::one());
 
-        tmp.add_assign(&R2);
+        tmp += &R2;
     }
+    
+    let mut p: [Scalar; 100] = [(); 100].map(|()| Scalar::random(&mut rng));
+    p[40] = Scalar::zero();
+    let mut q = [Scalar::zero(); 100];
+    Scalar::invert_batch(p.iter(), &mut q);
+
+    for (p, q) in p.iter().zip(q.iter()) {
+        if p.is_zero_vartime() {
+            assert!(q.is_zero_vartime());
+        } else {
+            assert_eq!(p.mul(q), Scalar::one())
+        }
+    }
+    
 }
 
 #[test]
@@ -1365,7 +1427,7 @@ fn test_invert_is_pow() {
         assert_eq!(r1, r2);
         assert_eq!(r2, r3);
         // Add R so we check something different next time around
-        r1.add_assign(&R);
+        r1 += &R;
         r2 = r1;
         r3 = r1;
     }

@@ -8,6 +8,7 @@
 //! * This implementation does not require the Rust standard library.
 //! * All operations are constant time unless explicitly noted.
 
+#![recursion_limit = "256"]
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 // Catch documentation errors caused by code changes.
@@ -34,8 +35,9 @@ extern crate std;
 #[cfg(feature = "groups")]
 mod tests;
 
+/// Utilities
 #[macro_use]
-mod util;
+pub mod util;
 
 /// Notes about how the BLS12-381 elliptic curve is designed, specified
 /// and implemented by this library.
@@ -55,12 +57,17 @@ mod fp2;
 #[cfg(feature = "groups")]
 mod g1;
 #[cfg(feature = "groups")]
+mod g1a;
+#[cfg(feature = "groups")]
 mod g2;
 
 #[cfg(feature = "groups")]
 pub use g1::{G1Affine, G1Projective};
 #[cfg(feature = "groups")]
 pub use g2::{G2Affine, G2Projective};
+#[cfg(feature = "groups")]
+pub use g1a::{G1Affine as G1AffineA, G1Projective as G1ProjectiveA, G1Precompute, G1PrecomputeAffine};
+
 
 #[cfg(feature = "groups")]
 mod fp12;

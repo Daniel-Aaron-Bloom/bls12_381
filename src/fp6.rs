@@ -2,7 +2,7 @@ use crate::fp::*;
 use crate::fp2::*;
 
 use core::fmt;
-use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+use core::ops::{Add, Mul, MulAssign, Neg, Sub};
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 
 #[cfg(feature = "pairings")]
@@ -84,7 +84,7 @@ impl ConstantTimeEq for Fp6 {
 
 impl Fp6 {
     #[inline]
-    pub fn zero() -> Self {
+    pub const fn zero() -> Self {
         Fp6 {
             c0: Fp2::zero(),
             c1: Fp2::zero(),
@@ -93,7 +93,7 @@ impl Fp6 {
     }
 
     #[inline]
-    pub fn one() -> Self {
+    pub const fn one() -> Self {
         Fp6 {
             c0: Fp2::one(),
             c1: Fp2::zero(),
@@ -193,7 +193,7 @@ impl Fp6 {
     }
 
     #[inline]
-    pub fn neg<const VARTIME: bool>(&self) -> Self {
+    pub const fn neg<const VARTIME: bool>(&self) -> Self {
         Fp6 {
             c0: (&self.c0).neg(),
             c1: (&self.c1).neg(),

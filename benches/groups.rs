@@ -2,13 +2,23 @@
 extern crate criterion;
 
 extern crate bls12_381;
-use bls12_381::{*, fp::Fp};
+use bls12_381::{*, fp::Fp, util};
 
 use criterion::{black_box, Criterion};
+use ff::Field;
+use rand_core::SeedableRng;
 
 const VARTIME: bool = true;
+type Timing = util::VarTime;
+type Scalar0 = Scalar<0, VARTIME>;
+
 
 fn criterion_benchmark(c: &mut Criterion) {
+    let mut rng = rand_xorshift::XorShiftRng::from_seed([
+        0x57, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
+        0xbc, 0xe5,
+    ]);
+
     // Pairings
     {
         let g = G1Affine::generator();
@@ -98,6 +108,51 @@ fn criterion_benchmark(c: &mut Criterion) {
         });
     }
 
+    // G1AProjective
+    {
+        let name = "G1ProjectiveA";
+        let a = G1ProjectiveA::<Timing>::generator();
+        let a_affine = G1AffineA::<Timing>::generator();
+        let s: Scalar = Scalar::from_raw([1, 2, 3, 4]);
+        c.bench_function(&format!("{} doubling", name), move |b| {
+            b.iter(|| black_box(a).double())
+        });
+        c.bench_function(&format!("{} addition", name), move |b| {
+            b.iter(|| black_box(a).add(&a))
+        });
+        c.bench_function(&format!("{} mixed addition", name), move |b| {
+            b.iter(|| black_box(a).add_mixed(&a_affine))
+        });
+    }
+
+    // G1Precompute
+    {
+        let name = "G1Precompute";
+        let a = G1Precompute::<512, Timing>::from(G1ProjectiveA::generator());
+        let s = Scalar0::from_raw([1, 2, 3, 4]);
+        let s = s.to_bytes();
+
+        c.bench_function(&format!("{} scalar multiplication", name), move |b| {
+            b.iter(|| black_box(a).multiply_vartime(black_box(&s)))
+        });
+    }
+    // G1PrecomputeAffine
+    {
+        let name = "G1PrecomputeAffine";
+        let a = G1PrecomputeAffine::from(G1Precompute::<512, Timing>::from(G1ProjectiveA::generator()));
+        let s = Scalar0::from_raw([1, 2, 3, 4]);
+        let va = [(); 32].map(|()| G1PrecomputeAffine::from(G1Precompute::<512, Timing>::from(G1ProjectiveA::generator().mul(&Scalar::random(&mut rng)))));
+        let vs = [(); 32].map(|()| Scalar0::random(&mut rng));
+
+        c.bench_function(&format!("{} scalar multiplication", name), move |b| {
+            b.iter(|| black_box(a).multiply_vartime(black_box(&s)))
+        });
+        c.bench_function(&format!("{} dot product", name), move |b| {
+            b.iter(|| G1PrecomputeAffine::dot_product_const::<32, VARTIME>(black_box(&va), black_box(&vs)))
+        });
+
+    }
+
     // G2Affine
     {
         let name = "G2Affine";
@@ -170,11 +225,6 @@ fn criterion_benchmark(c: &mut Criterion) {
     // Fp
     {
         let name = "Fp";
-        use rand_core::SeedableRng;
-        let mut rng = rand_xorshift::XorShiftRng::from_seed([
-            0x57, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
-            0xbc, 0xe5,
-        ]);
         let a = Fp::<0, true>::random(&mut rng);
 
         c.bench_function(&format!("{} sqrt", name), move |b| {

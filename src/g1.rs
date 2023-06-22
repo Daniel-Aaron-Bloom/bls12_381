@@ -3,7 +3,7 @@
 use core::borrow::Borrow;
 use core::fmt;
 use core::iter::Sum;
-use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+use core::ops::{Add, Mul, MulAssign, Neg, Sub};
 use group::{
     prime::{PrimeCurve, PrimeCurveAffine, PrimeGroup},
     Curve, Group, GroupEncoding, UncompressedEncoding,
@@ -15,7 +15,7 @@ use subtle::{Choice, ConditionallyNegatable, ConditionallySelectable, ConstantTi
 use group::WnafGroup;
 
 use crate::fp::Fp;
-use crate::util::{mac, sbb, MulOp, Ops, DoubleOp, MontOp, borrowing_sub, SquareOp};
+use crate::util::{mac, sbb, MulOp, DoubleOp, MontOp, borrowing_sub, SquareOp, Ops};
 use crate::Scalar;
 
 /// This is an element of $\mathbb{G}_1$ represented in the affine coordinate space.
@@ -479,6 +479,7 @@ const BETA_2: Fp = Fp::from_raw_unchecked([
 // The recoding width that determines the length and size of precomputation table.
 // Tested values are in 3..8.
 const G1_WIDTH: i32 = 5;
+const G1_LEN: usize = 2 + (128 - 1) / (G1_WIDTH - 1) as usize;
 
 #[inline]
 const fn sub_short(a: &[u64; 4], b: &[u64; 4]) -> ([u64; 4], bool) {
@@ -515,17 +516,17 @@ const fn mul_short(a: &[u64; 4], b: &[u64; 4]) -> [u64; 8] {
     [r0, r1, r2, r3, r4, r5, r6, 0]
 }
 
-fn glv_recoding<const VARTIME: bool>(k: &[u8; 32]) -> (i8, [u8; 32], i8, [u8; 32]) {
+const fn glv_recoding<const VARTIME: bool>(k: &[u8; 32]) -> (i8, [u8; 32], i8, [u8; 32]) {
     const V: [[u64; 4]; 2] = [
         [0x63f6_e522_f6cf_ee2f, 0x7c6b_ecf1_e01f_aadd, 1, 0],
         [0x0000_0000_ffff_ffff, 0xac45_a401_0001_a402, 0, 0],
     ];
 
     let t: [u64; 4] = [
-        u64::from_le_bytes(k[0..8].try_into().unwrap()),
-        u64::from_le_bytes(k[8..16].try_into().unwrap()),
-        u64::from_le_bytes(k[16..24].try_into().unwrap()),
-        u64::from_le_bytes(k[24..32].try_into().unwrap()),
+        le_bytes_to_u64!(k[0..]),
+        le_bytes_to_u64!(k[8..]),
+        le_bytes_to_u64!(k[16..]),
+        le_bytes_to_u64!(k[24..]),
     ];
 
     /* Multiply b2 by v[0] and round. */
@@ -535,36 +536,37 @@ fn glv_recoding<const VARTIME: bool>(k: &[u8; 32]) -> (i8, [u8; 32], i8, [u8; 32
     let b1 = mul_short(&b2h, &V[1]);
     let b1l = [b1[0], b1[1], b1[2], b1[3]];
     let (b1l, s1) = sub_short(&t, &b1l);
-    let minus_k1: Scalar = Scalar::from_raw([!b1l[0], !b1l[1], !b1l[2], !b1l[3]]) + Scalar::one();
+    let minus_k1: Scalar = (&Scalar::from_raw([!b1l[0], !b1l[1], !b1l[2], !b1l[3]])).add(&Scalar::one());
 
     let k1 = Scalar::from_raw(b1l);
-    let k1 = match VARTIME {
-        true if s1 => minus_k1,
-        true => k1,
-        false => Scalar::conditional_select(&k1, &minus_k1, Choice::from(s1 as u8)),
-    };
+    let k1 = Scalar::select(k1, minus_k1, s1);
     let k2: Scalar = Scalar::from_raw(b2h);
 
     // k2 is always positive for this curve.
     (-(s1 as i8), k1.to_bytes(), 0, k2.to_bytes())
 }
 
-fn regular_recoding(naf: &mut [i8; 128], sc: &mut [u8; 32]) {
-    let w = G1_WIDTH;
+const fn regular_recoding(w: i32, len: usize, mut sc: [u8; 32]) -> [i8; 129] {
+    let mut naf = [0 as i8; 129];
+
     // Joux-Tunstall regular recoding algorithm for parameterized w.
     let mask = (1 << w) - 1;
-    let len = 2 + (naf.len() - 1) / (w - 1) as usize;
 
-    for i in 0..(len - 1) {
+    let mut i = 0;
+    while i  < len - 1 {
         naf[i] = ((sc[0] & mask) as i8) - (1 << (w - 1));
         sc[0] = ((sc[0] as i8) - naf[i]) as u8;
         // Divide by (w - 1)
-        for j in 0..31 {
+        let mut j = 0;
+        while j < 31 {
             sc[j] = (sc[j] >> (w - 1)) | sc[j + 1] << (8 - (w - 1));
+            j += 1;
         }
         sc[31] >>= w - 1;
+        i += 1;
     }
     naf[len - 1] = sc[0] as i8;
+    naf
 }
 
 fn endomorphism<const VARTIME: bool>(p: &G1Affine<VARTIME>) -> G1Affine<VARTIME> {
@@ -816,7 +818,6 @@ impl<const VARTIME: bool> G1Projective<VARTIME> {
         }
     }
 
-
     /// Returns true if this element is the identity (the point at infinity).
     #[inline]
     pub fn is_identity(&self) -> Choice {
@@ -877,22 +878,22 @@ impl<const VARTIME: bool> G1Projective<VARTIME> {
         let t4 = Ops::add(&rhs.x, &rhs.y);
         let t3 = MontOp::montgomery_reduce(&MulOp::mul(&t3, &t4));
         let t4 = Ops::add(&t0, &t1);
-        let t3 = Ops::sub(&t3, &t4);
+        let t3 = Ops::sub(&t3, &t4).reduce_full();
         let t4 = Ops::add(&self.y, &self.z);
         let x3 = Ops::add(&rhs.y, &rhs.z);
         let t4 = MontOp::montgomery_reduce(&MulOp::mul(&t4, &x3));
         let x3 = Ops::add(&t1, &t2);
-        let t4 = Ops::sub(&t4, &x3);
+        let t4 = Ops::sub(&t4, &x3).reduce_full();
         let x3 = Ops::add(&self.x, &self.z);
         let y3 = Ops::add(&rhs.x, &rhs.z);
         let x3 = MontOp::montgomery_reduce(&MulOp::mul(&x3, &y3));
         let y3 = Ops::add(&t0, &t2);
-        let y3 = Ops::sub(&x3, &y3);
+        let y3 = Ops::sub(&x3, &y3).reduce_full();
         let x3 = DoubleOp::<0>::double(&t0);
         let t0 = Ops::add(&x3, &t0);
         let t2 = mul_by_3b(t2.reduce_full());
         let z3 = Ops::add(&t1, &t2);
-        let t1 = Ops::sub(&t1, &t2);
+        let t1 = Ops::sub(&t1, &t2).reduce_full();
         let y3 = mul_by_3b(y3.reduce_full());
         let x3 = MulOp::mul(&t4, &y3); // t4 * y3
         let t2 = MulOp::mul(&t3, &t1); // t3 * t1
@@ -994,8 +995,6 @@ impl<const VARTIME: bool> G1Projective<VARTIME> {
         let len = 2 + (128 - 1) / (G1_WIDTH - 1) as usize;
 
         // Allocate longest possible vector, recode scalar and precompute table.
-        let mut naf1 = [0 as i8; 128];
-        let mut naf2 = [0 as i8; 128];
         let (s1, mut k1, s2, mut k2) = glv_recoding::<VARTIME>(&by);
         let mut table = self.precompute();
 
@@ -1004,10 +1003,10 @@ impl<const VARTIME: bool> G1Projective<VARTIME> {
         let bit2 = k2[0] & 1u8;
         k2[0] |= 1;
 
-        regular_recoding(&mut naf1, &mut k1);
-        regular_recoding(&mut naf2, &mut k2);
+        let naf1 = regular_recoding(G1_WIDTH, G1_LEN, k1);
+        let naf2 = regular_recoding(G1_WIDTH, G1_LEN, k2);
 
-        for i in (0..len).rev() {
+        for i in (0..G1_LEN).rev() {
             for _ in 1..G1_WIDTH {
                 acc = acc.double();
             }
@@ -1041,6 +1040,7 @@ impl<const VARTIME: bool> G1Projective<VARTIME> {
             t.x *= BETA_2.vartime::<VARTIME>();
             acc += t;
         }
+
         // If the subscalars were even, fix result here.
         let t = match VARTIME {
             true if s1 == -1 => -table[0],
@@ -1602,6 +1602,13 @@ fn test_projective_addition() {
         let b: G1Projective = G1Projective::identity();
         let c = a + b;
         assert!(bool::from(c.is_identity()));
+        assert!(bool::from(c.is_on_curve()));
+    }
+    {
+        let a: G1Projective = G1Projective::generator();
+        let b: G1Projective = G1Projective::generator();
+        let c = a + b;
+        assert!(bool::from(!c.is_identity()));
         assert!(bool::from(c.is_on_curve()));
     }
     {
