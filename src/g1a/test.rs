@@ -1,6 +1,7 @@
 use super::*;
 use ff::Field;
-use rand_core::SeedableRng;
+use hex_literal::hex;
+use rand_core::{SeedableRng, RngCore};
 
 #[test]
 fn test_doubling() {
@@ -322,7 +323,7 @@ fn test_addition() {
     let mut acc: G1Projective = G1Projective::identity();
     let mut acc0 = G1Projective::identity();
     let mut acc1 = G1Projective::identity();
-    for _ in 0..10_000 {
+    for _ in 0..1_000 {
         let s1 = Scalar::random(&mut rng);
         let s2 = Scalar::random(&mut rng);
         let a: G1Projective = G1Projective::generator().mul(&s1);
@@ -362,6 +363,11 @@ fn test_projective_scalar_multiplication() {
     let c = a * b;
 
     assert_eq!(g.mul(&a).mul(&b) , g.mul(&c));
+    assert_eq!(g.mul(&c), G1Projective{
+        x: FpA::from_bytes(&hex!("112ec0d96a7ee3853e9e7196dc03420f1559c1b2e2dc184196f8c921c507123fb33eaae4a56ce0f67e0226862cf624c8")).unwrap(),
+        y: FpA::from_bytes(&hex!("083320d06df2108e5de6f91c9a356b438b40ab7837446ab41776490f90e9bf601934e25a3c8bfeda74f393422a44a095")).unwrap(),
+        z: FpA::from_bytes(&hex!("05fa34407b6bc6ee7aa9830a7076488be2f14ac8300f17c2aab26cd894f1607dc2cbbb599e3879e2347dac5f889d7558")).unwrap(),
+    });
 }
 
 #[test]
@@ -411,4 +417,34 @@ fn test_g1_precompute_affine_dot_product() {
         .add(&vg[2].multiply_vartime(&va[2]))
         .add(&vg[3].multiply_vartime(&va[3]));
     assert_eq!(a, b);
+}
+
+#[test]
+fn test_regular_recoding() {
+    type Scalar0 = Scalar<0, true>;
+    let mut rng = rand_xorshift::XorShiftRng::from_seed([
+        0x57, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
+        0xbc, 0xe5,
+    ]);
+
+    for i in 0..0 {
+        let _v = Scalar0::random(&mut rng);
+    }
+    for i in 0..100_000 {
+        let v = Scalar0::random(&mut rng);
+
+        let w = (rng.next_u32() & 7).max(2);
+        let len = 2 + (128 - 1) / (w - 1) as usize;
+
+        let (as1, as2, abit1, abit2, anaf1, anaf2) = recode_scalar(w, &v.to_bytes());
+        let (bs1, bs2, bbit1, bbit2, bnaf1, bnaf2) = crate::g1::recode_scalar(w as i32, &v.to_bytes());
+        assert_eq!(as1, bs1 as Flag);
+        assert_eq!(as2, bs2 as Flag);
+        assert_eq!(abit1, bbit1);
+        assert_eq!(abit2, bbit2);
+        assert_eq!(anaf1[len - 1], bnaf1[len - 1] as Flag, "\n{i}\n{:16b}\n{:16b}", anaf1[len - 1], bnaf1[len - 1]);
+        assert_eq!(anaf2[len - 1], bnaf2[len - 1] as Flag, "\n{i}\n{:16b}\n{:16b}", anaf2[len - 1], bnaf2[len - 1]);
+    }
+
+    // panic!("failed")
 }

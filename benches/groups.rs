@@ -60,7 +60,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         });
         c.bench_function(
             &format!("{} deserialize compressed point", name),
-            move |b| b.iter(|| G1Affine::from_compressed(black_box(&compressed))),
+            move |b| b.iter(|| G1Affine::<VARTIME>::from_compressed(black_box(&compressed))),
         );
         c.bench_function(
             &format!("{} deserialize uncompressed point", name),

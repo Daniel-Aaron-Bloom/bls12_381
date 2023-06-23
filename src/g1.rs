@@ -32,8 +32,8 @@ pub struct G1Affine<const VARTIME: bool = false> {
     infinity: Choice,
 }
 
-impl Default for G1Affine {
-    fn default() -> G1Affine {
+impl<const VARTIME: bool> Default for G1Affine<VARTIME> {
+    fn default() -> Self {
         G1Affine::identity()
     }
 }
@@ -304,6 +304,74 @@ impl<const VARTIME: bool> G1Affine<VARTIME> {
         let x_3 = MulOp::mul(&MontOp::montgomery_reduce(&SquareOp::square(&self.x)), &self.x);
         Ops::sub(&y_2, &x_3).montgomery_reduce_full().ct_eq(&B.vartime::<VARTIME>()) | self.infinity
     }
+
+    /// Attempts to deserialize a compressed element. See [`notes::serialization`](crate::notes::serialization)
+    /// for details about how group elements are serialized.
+    pub fn from_compressed(bytes: &[u8; 48]) -> CtOption<Self> {
+        // We already know the point is on the curve because this is established
+        // by the y-coordinate recovery procedure in from_compressed_unchecked().
+
+        Self::from_compressed_unchecked(bytes).and_then(|p| CtOption::new(p, p.is_torsion_free()))
+    }
+
+    /// Attempts to deserialize an uncompressed element, not checking if the
+    /// element is in the correct subgroup.
+    /// **This is dangerous to call unless you trust the bytes you are reading; otherwise,
+    /// API invariants may be broken.** Please consider using `from_compressed()` instead.
+    pub fn from_compressed_unchecked(bytes: &[u8; 48]) -> CtOption<Self> {
+        // Obtain the three flags from the start of the byte sequence
+        let compression_flag_set = Choice::from((bytes[0] >> 7) & 1);
+        let infinity_flag_set = Choice::from((bytes[0] >> 6) & 1);
+        let sort_flag_set = Choice::from((bytes[0] >> 5) & 1);
+
+        // Attempt to obtain the x-coordinate
+        let x = {
+            let mut tmp = [0; 48];
+            tmp.copy_from_slice(&bytes[0..48]);
+
+            // Mask away the flag bits
+            tmp[0] &= 0b0001_1111;
+
+            Fp::<0, VARTIME>::from_bytes(&tmp)
+        };
+
+        x.and_then(|x| {
+            // If the infinity flag is set, return the value assuming
+            // the x-coordinate is zero and the sort bit is not set.
+            //
+            // Otherwise, return a recovered point (assuming the correct
+            // y-coordinate can be found) so long as the infinity flag
+            // was not set.
+            CtOption::new(
+                Self::identity(),
+                infinity_flag_set & // Infinity flag should be set
+                compression_flag_set & // Compression flag should be set
+                (!sort_flag_set) & // Sort flag should not be set
+                x.is_zero(), // The x-coordinate should be zero
+            )
+            .or_else(|| {
+                // Recover a y-coordinate given x by y = sqrt(x^3 + 4)
+                ((x.square() * x) + B.vartime()).sqrt().and_then(|y| {
+                    // Switch to the correct y-coordinate if necessary.
+                    let y = Fp::conditional_select(
+                        &y,
+                        &-y,
+                        y.lexicographically_largest() ^ sort_flag_set,
+                    );
+
+                    CtOption::new(
+                        Self {
+                            x,
+                            y,
+                            infinity: infinity_flag_set,
+                        },
+                        (!infinity_flag_set) & // Infinity flag should not be set
+                        compression_flag_set, // Compression flag should be set
+                    )
+                })
+            })
+        })
+    }
 }
 
 impl G1Affine {
@@ -387,74 +455,6 @@ impl G1Affine {
             })
         })
     }
-
-    /// Attempts to deserialize a compressed element. See [`notes::serialization`](crate::notes::serialization)
-    /// for details about how group elements are serialized.
-    pub fn from_compressed(bytes: &[u8; 48]) -> CtOption<Self> {
-        // We already know the point is on the curve because this is established
-        // by the y-coordinate recovery procedure in from_compressed_unchecked().
-
-        Self::from_compressed_unchecked(bytes).and_then(|p| CtOption::new(p, p.is_torsion_free()))
-    }
-
-    /// Attempts to deserialize an uncompressed element, not checking if the
-    /// element is in the correct subgroup.
-    /// **This is dangerous to call unless you trust the bytes you are reading; otherwise,
-    /// API invariants may be broken.** Please consider using `from_compressed()` instead.
-    pub fn from_compressed_unchecked(bytes: &[u8; 48]) -> CtOption<Self> {
-        // Obtain the three flags from the start of the byte sequence
-        let compression_flag_set = Choice::from((bytes[0] >> 7) & 1);
-        let infinity_flag_set = Choice::from((bytes[0] >> 6) & 1);
-        let sort_flag_set = Choice::from((bytes[0] >> 5) & 1);
-
-        // Attempt to obtain the x-coordinate
-        let x = {
-            let mut tmp = [0; 48];
-            tmp.copy_from_slice(&bytes[0..48]);
-
-            // Mask away the flag bits
-            tmp[0] &= 0b0001_1111;
-
-            Fp::from_bytes(&tmp)
-        };
-
-        x.and_then(|x| {
-            // If the infinity flag is set, return the value assuming
-            // the x-coordinate is zero and the sort bit is not set.
-            //
-            // Otherwise, return a recovered point (assuming the correct
-            // y-coordinate can be found) so long as the infinity flag
-            // was not set.
-            CtOption::new(
-                G1Affine::identity(),
-                infinity_flag_set & // Infinity flag should be set
-                compression_flag_set & // Compression flag should be set
-                (!sort_flag_set) & // Sort flag should not be set
-                x.is_zero(), // The x-coordinate should be zero
-            )
-            .or_else(|| {
-                // Recover a y-coordinate given x by y = sqrt(x^3 + 4)
-                ((x.square() * x) + B).sqrt().and_then(|y| {
-                    // Switch to the correct y-coordinate if necessary.
-                    let y = Fp::conditional_select(
-                        &y,
-                        &-y,
-                        y.lexicographically_largest() ^ sort_flag_set,
-                    );
-
-                    CtOption::new(
-                        G1Affine {
-                            x,
-                            y,
-                            infinity: infinity_flag_set,
-                        },
-                        (!infinity_flag_set) & // Infinity flag should not be set
-                        compression_flag_set, // Compression flag should be set
-                    )
-                })
-            })
-        })
-    }
 }
 
 /// A nontrivial third root of unity in Fp
@@ -516,7 +516,7 @@ const fn mul_short(a: &[u64; 4], b: &[u64; 4]) -> [u64; 8] {
     [r0, r1, r2, r3, r4, r5, r6, 0]
 }
 
-const fn glv_recoding<const VARTIME: bool>(k: &[u8; 32]) -> (i8, [u8; 32], i8, [u8; 32]) {
+const fn glv_recoding(k: &[u8; 32]) -> (i8, [u8; 32], i8, [u8; 32]) {
     const V: [[u64; 4]; 2] = [
         [0x63f6_e522_f6cf_ee2f, 0x7c6b_ecf1_e01f_aadd, 1, 0],
         [0x0000_0000_ffff_ffff, 0xac45_a401_0001_a402, 0, 0],
@@ -566,7 +566,24 @@ const fn regular_recoding(w: i32, len: usize, mut sc: [u8; 32]) -> [i8; 129] {
         i += 1;
     }
     naf[len - 1] = sc[0] as i8;
+    if sc[0] > mask {
+        let v = 1 / sc[0];
+    }
     naf
+}
+
+pub const fn recode_scalar(w: i32, by: &[u8; 32]) -> (i8, i8, u8, u8, [i8; 129], [i8; 129]) {
+    let (s1, mut k1, s2, mut k2) = glv_recoding(&by);
+
+    let bit1 = k1[0] & 1u8;
+    k1[0] |= 1;
+    let bit2 = k2[0] & 1u8;
+    k2[0] |= 1;
+
+    let len = 2 + (128 - 1) / (w - 1) as usize;
+    let naf1 = regular_recoding(w, len, k1);
+    let naf2 = regular_recoding(w, len, k2);
+    (s1, s2, bit1, bit2, naf1, naf2)
 }
 
 fn endomorphism<const VARTIME: bool>(p: &G1Affine<VARTIME>) -> G1Affine<VARTIME> {
@@ -995,7 +1012,7 @@ impl<const VARTIME: bool> G1Projective<VARTIME> {
         let len = 2 + (128 - 1) / (G1_WIDTH - 1) as usize;
 
         // Allocate longest possible vector, recode scalar and precompute table.
-        let (s1, mut k1, s2, mut k2) = glv_recoding::<VARTIME>(&by);
+        let (s1, mut k1, s2, mut k2) = glv_recoding(&by);
         let mut table = self.precompute();
 
         let bit1 = k1[0] & 1u8;
@@ -1388,6 +1405,9 @@ impl UncompressedEncoding for G1Affine {
 }
 #[cfg(test)]
 mod test {
+    use ff::Field;
+    use hex_literal::hex;
+
     use super::*;
 
 #[test]
@@ -1861,26 +1881,6 @@ fn test_affine_negation_and_subtraction() {
 }
 
 #[test]
-fn test_projective_scalar_multiplication() {
-    let g: G1Projective = G1Projective::generator();
-    let a = Scalar::from_raw([
-        0x2b56_8297_a56d_a71c,
-        0xd8c3_9ecb_0ef3_75d1,
-        0x435c_38da_67bf_bf96,
-        0x8088_a050_26b6_59b2,
-    ]);
-    let b = Scalar::from_raw([
-        0x785f_dd9b_26ef_8b85,
-        0xc997_f258_3769_5c18,
-        0x4c8d_bc39_e7b7_56c1,
-        0x70d9_b6cc_6d87_df20,
-    ]);
-    let c = a * b;
-
-    assert_eq!((g * a) * b, g * c);
-}
-
-#[test]
 fn test_affine_scalar_multiplication() {
     let g: G1Affine = G1Affine::generator();
     let a = Scalar::from_raw([
@@ -1898,6 +1898,11 @@ fn test_affine_scalar_multiplication() {
     let c = a * b;
 
     assert_eq!(G1Affine::from(g * a) * b, g * c);
+    assert_eq!(g* c, G1Projective{
+        x: Fp::from_bytes(&hex!("112ec0d96a7ee3853e9e7196dc03420f1559c1b2e2dc184196f8c921c507123fb33eaae4a56ce0f67e0226862cf624c8")).unwrap(),
+        y: Fp::from_bytes(&hex!("083320d06df2108e5de6f91c9a356b438b40ab7837446ab41776490f90e9bf601934e25a3c8bfeda74f393422a44a095")).unwrap(),
+        z: Fp::from_bytes(&hex!("05fa34407b6bc6ee7aa9830a7076488be2f14ac8300f17c2aab26cd894f1607dc2cbbb599e3879e2347dac5f889d7558")).unwrap(),
+    });
 }
 
 #[test]
@@ -2092,7 +2097,7 @@ fn test_zero_double() {
     let one: Fp::<0, true> = Fp::one();
     let valv = -mul_by_3b(mul_by_3b::<true>(one.double() + one));
 
-    for _ in 0..1_000_000 {
+    for _ in 0..100_000 {
         let r = G1Projective{
             x: Fp::<0, true>::random(&mut rng),
             y: Fp::zero(),

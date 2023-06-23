@@ -136,6 +136,32 @@ impl<T: Timing> G1Affine<T> {
         let x_3 = self.x.square().montgomery_reduce().mul(&self.x);
         y_2.sub(&x_3).montgomery_reduce().mag().ct_eq(&B.vartime()) | T::to_choice(self.infinity)
     }
+
+    /// Serializes this element into compressed form. See [`notes::serialization`](crate::notes::serialization)
+    /// for details about how group elements are serialized.
+    pub fn to_compressed(&self) -> [u8; 48] {
+        let infinity = T::to_choice(self.infinity);
+        // Strictly speaking, self.x is zero already when self.infinity is true, but
+        // to guard against implementation mistakes we do not assume this.
+        let mut res = FpA::conditional_select(&self.x, &FpA::zero(), infinity).to_bytes();
+
+        // This point is in compressed form, so we set the most significant bit.
+        res[0] |= 1u8 << 7;
+
+        // Is this point at infinity? If so, set the second-most significant bit.
+        res[0] |= u8::conditional_select(&0u8, &(1u8 << 6), infinity);
+
+        // Is the y-coordinate the lexicographically largest of the two associated with the
+        // x-coordinate? If so, set the third-most significant bit so long as this is not
+        // the point at infinity.
+        res[0] |= u8::conditional_select(
+            &0u8,
+            &(1u8 << 5),
+            (!infinity) & self.y.lexicographically_largest(),
+        );
+
+        res
+    }
 }
 
 const B: FpA = FpA::from_raw_unchecked([
@@ -621,14 +647,16 @@ const fn regular_recoding(w: u32, len: usize, sc: [u8; 32]) -> [Flag; 129] {
         // Divide by (w - 1)
         sc[0] = (sc[0] >> (w - 1)) | sc[1] << (u128::BITS - (w - 1));
         sc[1] >>= w - 1;
+
         i += 1;
     }
+
     naf[len - 1] = sc[0] as Flag;
+    
     naf
 }
 
-const fn recode_scalar<const P: usize>(by: &[u8; 32]) -> (Flag, Flag, u8, u8, [Flag; 129], [Flag; 129]) 
-where FpMag<P>: Precompute {
+const fn recode_scalar(w: u32, by: &[u8; 32]) -> (Flag, Flag, u8, u8, [Flag; 129], [Flag; 129]) {
     let (s1, mut k1, s2, mut k2) = glv_recoding(&by);
 
     let bit1 = k1[0] & 1u8;
@@ -636,9 +664,9 @@ where FpMag<P>: Precompute {
     let bit2 = k2[0] & 1u8;
     k2[0] |= 1;
 
-    let len = 2 + (128 - 1) / (FpMag::<P>::W - 1) as usize;
-    let naf1 = regular_recoding(FpMag::<P>::W, len, k1);
-    let naf2 = regular_recoding(FpMag::<P>::W, len, k2);
+    let len = 2 + (128 - 1) / (w - 1) as usize;
+    let naf1 = regular_recoding(w, len, k1);
+    let naf2 = regular_recoding(w, len, k2);
     (s1, s2, bit1, bit2, naf1, naf2)
 }
 
@@ -721,19 +749,8 @@ where FpMag<P>: Precompute {
 
     /// Multiplies this point by a scalar.
     pub fn multiply(&self, by: &[u8; 32]) -> G1Projective<T> {
-        // let (s1, mut k1, s2, mut k2) = glv_recoding(&by);
-
-        // let bit1 = k1[0] & 1u8;
-        // k1[0] |= 1;
-        // let bit2 = k2[0] & 1u8;
-        // k2[0] |= 1;
-
-        // let len = 2 + (128 - 1) / (FpMag::<P>::W - 1) as usize;
-        // let naf1 = regular_recoding(FpMag::<P>::W, len, k1);
-        // let naf2 = regular_recoding(FpMag::<P>::W, len, k2);
-
         let len = 2 + (128 - 1) / (FpMag::<P>::W - 1) as usize;
-        let (s1, s2, bit1, bit2, naf1, naf2) = recode_scalar::<P>(by);
+        let (s1, s2, bit1, bit2, naf1, naf2) = recode_scalar(FpMag::<P>::W, by);
 
         let table = &self.table;
         let mut acc = G1Projective::identity();
@@ -823,7 +840,7 @@ where FpMag<P>: Precompute {
         // let naf2 = regular_recoding(FpMag::<P>::W, len, k2);
 
         let len = 2 + (128 - 1) / (FpMag::<P>::W - 1) as usize;
-        let (s1, s2, bit1, bit2, naf1, naf2) = recode_scalar::<P>(by);
+        let (s1, s2, bit1, bit2, naf1, naf2) = recode_scalar(FpMag::<P>::W, by);
 
         let table = &self.table;
         let mut acc = G1Projective::identity();
@@ -1026,6 +1043,8 @@ where FpMag<P>: Precompute {
     /// Multiplies and sums a series of points by a series of corresponding scalars.
     pub fn dot_product<const VARTIME: bool>(v: &[Self], s: &[Scalar<0, VARTIME>]) -> G1Projective<VarTime> {
         use alloc::vec::Vec;
+
+        assert!(v.len() >= s.len());
         
         let len = 2 + (128 - 1) / (FpMag::<P>::W - 1) as usize;
         let s = s.iter()

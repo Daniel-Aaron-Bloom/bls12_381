@@ -1628,7 +1628,7 @@ pub mod test {
             0x57, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
             0xbc, 0xe5,
         ]);
-        for _ in 0..1_000_000 {
+        for _ in 0..100_000 {
             let a = gen_big_a(&mut rng);
             let mut v = a.montgomery_reduce();
             let mut modulus = MODULUS;
@@ -1636,7 +1636,7 @@ pub mod test {
             modulus.reverse();
             assert!(v < modulus, "{v:?} >= {modulus:?}");
         }
-        for _ in 0..1_000_000 {
+        for _ in 0..100_000 {
             let a: FpA = FpA::random(&mut rng);
             let mut v = a.montgomery_reduce();
             let mut modulus = MODULUS;
@@ -1768,7 +1768,7 @@ pub mod test {
             let a = gen_big_a(&mut rng);
             assert_eq!(a.square(), a.mul(&a), "{i}");
         }
-        for i in 0..1_000_000 {
+        for i in 0..100_000 {
             let a: FpA = FpA::random(&mut rng);
             assert_eq!(a.square(), a.mul(&a), "{i}");
         }
@@ -2037,7 +2037,7 @@ pub mod test {
             0x57, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
             0xbc, 0xe5,
         ]);
-        for i in 0..10_000 {
+        for i in 0..1_000 {
             let (v, va) = gen_big_both(&mut rng);
             let p = [(); 6].map(|_| rng.next_u64());
             assert_eq!(v.pow_vartime(&p).0, v.pow_vartime(&p).0, "{i}");

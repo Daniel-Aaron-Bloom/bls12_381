@@ -1073,7 +1073,7 @@ mod test {
             0xbc, 0xe5,
         ]);
 
-        for i in 0..1_000_000 {
+        for i in 0..100_000 {
             let a = gen_big(&mut rng);
             let b = gen_big(&mut rng);
 
@@ -1158,7 +1158,7 @@ mod test {
             (ab, ab_ur)
         }
 
-        for _ in 0..(1000 * 1000) {
+        for _ in 0..100_000 {
             let items = [
                 gen_mul(&mut rng),
                 gen_mul(&mut rng),

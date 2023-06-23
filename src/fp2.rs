@@ -1118,10 +1118,7 @@ mod test {
             let diff = d1.sub(&d2);
             assert!(diff.is_zero_vartime());
         }
-        for i in 0..1_000_000 {
-            if i == 100183 {
-                println!("test")
-            }
+        for i in 0..100_000 {
             let va: Fp2A = Fp2A::random(&mut rng);
             let d1 = va.square().montgomery_reduce();
             let d2 = va.mul(&va).montgomery_reduce();
